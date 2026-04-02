@@ -1,233 +1,148 @@
-name: dora-separation-theorem
+name: dora-separation-theorem-correct
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 jobs:
-  run:
-    runs-on: macos-latest
+run:
+runs-on: macos-latest
 
-    env:
-      PYTHONUNBUFFERED: 1
-      HF_HOME: ${{ github.workspace }}/.hf-cache
-      HF_HUB_ENABLE_HF_TRANSFER: 1
-      MODEL_ID: Qwen/Qwen2-0.5B
+```
+steps:
+  - uses: actions/checkout@v4
 
-    steps:
-      - uses: actions/checkout@v4
+  - name: Install deps
+    run: |
+      pip install mlx mlx_lm
 
-      ############################################################
-      # STEP 1: SETUP
-      ############################################################
-      - name: Install deps
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install mlx mlx-lm numpy
+  - name: Run TRUE distillation experiment
+    run: |
+      python - <<'PY'
+      import mlx.core as mx
+      from mlx_lm import load
 
-      ############################################################
-      # STEP 2: BUILD TINY AGENTIC DATASET
-      ############################################################
-      - name: Create dataset (issue → patch)
-        run: |
-          set -euxo pipefail
-          mkdir -p data/base
+      print("\n==============================")
+      print("STEP 1: LOAD MODEL")
+      print("==============================")
 
-          cat > data/base/train.jsonl <<'JSON'
-          {"prompt":"Fix bug: function returns wrong sum\n\n### file: math.py\n\ndef add(a,b):\n    return a-b\n\nTask: fix","completion":"diff --git a/math.py b/math.py\n@@\n- return a-b\n+ return a+b"}
-          {"prompt":"Fix bug: string reverse broken\n\n### file: util.py\n\ndef rev(s):\n    return s\n\nTask: fix","completion":"diff --git a/util.py b/util.py\n@@\n- return s\n+ return s[::-1]"}
-          {"prompt":"Fix bug: multiply wrong\n\n### file: mul.py\n\ndef mul(a,b):\n    return a+b\n\nTask: fix","completion":"diff --git a/mul.py b/mul.py\n@@\n- return a+b\n+ return a*b"}
-          JSON
+      model, tokenizer = load("Qwen/Qwen2-0.5B")
 
-          cp data/base/train.jsonl data/base/valid.jsonl
+      def get_probs(prompt):
+          ids = tokenizer.encode(prompt)
+          x = mx.array([ids], dtype=mx.int32)
+          logits = model(x)[0, -1, :]
+          probs = mx.softmax(logits).astype(mx.float32)
+          return probs
 
-      ############################################################
-      # STEP 3: GENERATE INTERFACE DATA (CRITICAL)
-      ############################################################
-      - name: Generate argmax/topk/probs datasets
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import os, json
-          import mlx.core as mx
-          from mlx_lm import load
+      prompts = [
+          "Fix bug: def add(a,b): return a-b",
+          "Reverse string in Python",
+          "Multiply two numbers function",
+          "Fix division by zero",
+          "Sort a list ascending",
+      ]
 
-          model, tokenizer = load(os.environ["MODEL_ID"])
+      vocab_size = get_probs(prompts[0]).shape[0]
 
-          def tok(x):
-              return tokenizer.encode(x)
+      print("\n==============================")
+      print("STEP 2: BUILD TRUE DATASET")
+      print("==============================")
 
-          def get_probs(prompt):
-              ids = tok(prompt)
-              x = mx.array([ids], dtype=mx.int32)
-              logits = model(x)
-              logits = logits[0, -1, :]
-              probs = mx.softmax(logits)
-              return probs.astype(mx.float32)
+      dataset = []
 
-          base = []
-          with open("data/base/train.jsonl") as f:
-              for line in f:
-                  base.append(json.loads(line))
+      for p in prompts:
+          v = get_probs(p)
 
-          os.makedirs("data/argmax", exist_ok=True)
-          os.makedirs("data/topk", exist_ok=True)
-          os.makedirs("data/probs", exist_ok=True)
+          argmax_target = mx.zeros_like(v)
+          argmax_target[int(mx.argmax(v).item())] = 1.0
 
-          def write(path, rows):
-              with open(path, "w") as f:
-                  for r in rows:
-                      f.write(json.dumps(r) + "\n")
+          k = 5
+          topk_ids = mx.argsort(v)[-k:]
+          topk_target = mx.zeros_like(v)
+          topk_vals = v[topk_ids]
+          topk_vals = topk_vals / mx.sum(topk_vals)
+          topk_target[topk_ids] = topk_vals
 
-          argmax_rows, topk_rows, probs_rows = [], [], []
+          probs_target = v
 
-          for row in base:
-              p = get_probs(row["prompt"])
+          dataset.append((p, argmax_target, topk_target, probs_target))
 
-              # argmax
-              idx = int(mx.argmax(p).item())
-              argmax_rows.append({
-                  "prompt": row["prompt"],
-                  "completion": str(idx)
-              })
+      print("Dataset built with REAL probability targets")
 
-              # topk
-              k = 5
-              idxs = mx.argsort(p)[-k:][::-1]
-              vals = mx.take(p, idxs)
-              vals = vals / mx.sum(vals)
-              topk_rows.append({
-                  "prompt": row["prompt"],
-                  "completion": ",".join(map(str, idxs.tolist()))
-              })
+      print("\n==============================")
+      print("STEP 3: DEFINE STUDENTS")
+      print("==============================")
 
-              # probs (dense truncated)
-              topk = 20
-              idxs = mx.argsort(p)[-topk:][::-1]
-              vals = mx.take(p, idxs)
-              vals = vals / mx.sum(vals)
-              probs_rows.append({
-                  "prompt": row["prompt"],
-                  "completion": json.dumps({
-                      "ids": idxs.tolist(),
-                      "probs": [float(x) for x in vals.tolist()]
-                  })
-              })
+      class Student:
+          def __init__(self):
+              self.logits = mx.zeros(vocab_size)
 
-          write("data/argmax/train.jsonl", argmax_rows)
-          write("data/topk/train.jsonl", topk_rows)
-          write("data/probs/train.jsonl", probs_rows)
+          def probs(self):
+              return mx.softmax(self.logits)
 
-          write("data/argmax/valid.jsonl", argmax_rows)
-          write("data/topk/valid.jsonl", topk_rows)
-          write("data/probs/valid.jsonl", probs_rows)
+          def update(self, grad, lr=0.5):
+              self.logits = self.logits - lr * grad
 
-          print("DATASETS BUILT")
-          PY
+      def kl_grad(student_probs, target_probs):
+          return student_probs - target_probs
 
-      ############################################################
-      # STEP 4: TRAIN 3 DORA STUDENTS
-      ############################################################
-      - name: Train argmax student
-        run: |
-          python -m mlx_lm.lora \
-            --model $MODEL_ID \
-            --train \
-            --data data/argmax \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 80 \
-            --steps-per-report 1 \
-            --save-every 40
+      students = {
+          "argmax": Student(),
+          "topk": Student(),
+          "probs": Student(),
+      }
 
-      - name: Train topk student
-        run: |
-          python -m mlx_lm.lora \
-            --model $MODEL_ID \
-            --train \
-            --data data/topk \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 80 \
-            --steps-per-report 1 \
-            --save-every 40
+      print("\n==============================")
+      print("STEP 4: TRAIN (REAL KL DISTILLATION)")
+      print("==============================")
 
-      - name: Train probs student
-        run: |
-          python -m mlx_lm.lora \
-            --model $MODEL_ID \
-            --train \
-            --data data/probs \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 80 \
-            --steps-per-report 1 \
-            --save-every 40
+      epochs = 200
 
-      ############################################################
-      # STEP 5: EVALUATE SEPARATION THEOREM
-      ############################################################
-      - name: Evaluate KL vs agreement
-        run: |
-          python - <<'PY'
-          import mlx.core as mx
-          from mlx_lm import load
+      for epoch in range(epochs):
+          for prompt, a_t, t_t, p_t in dataset:
+              for name, student in students.items():
+                  sp = student.probs()
 
-          model, tokenizer = load("Qwen/Qwen2-0.5B")
+                  if name == "argmax":
+                      target = a_t
+                  elif name == "topk":
+                      target = t_t
+                  else:
+                      target = p_t
 
-          prompts = [
-              "Fix sum bug",
-              "Reverse string",
-              "Multiply numbers",
-              "Fix division",
-          ]
+                  grad = kl_grad(sp, target)
+                  student.update(grad)
 
-          def get_probs(m, tok, prompt):
-              ids = tok.encode(prompt)
-              x = mx.array([ids], dtype=mx.int32)
-              logits = m(x)[0, -1, :]
-              return mx.softmax(logits).astype(mx.float32)
+      print("Training complete")
 
-          victim = model
+      print("\n==============================")
+      print("STEP 5: EVALUATION")
+      print("==============================")
 
-          students = {
-              "argmax": model,
-              "topk": model,
-              "probs": model,
-          }
+      def kl(p, q):
+          return float(mx.sum(p * mx.log(p / q)).item())
 
-          print("\n===== SEPARATION TEST =====\n")
+      for name, student in students.items():
+          agreements = []
+          kls = []
 
-          for name, student in students.items():
-              agreements = []
-              kls = []
+          for prompt, a_t, t_t, p_t in dataset:
+              v = p_t
+              s = student.probs()
 
-              for p in prompts:
-                  v = get_probs(victim, tokenizer, p)
-                  s = get_probs(student, tokenizer, p)
+              vt = int(mx.argmax(v).item())
+              st = int(mx.argmax(s).item())
 
-                  vt = int(mx.argmax(v).item())
-                  st = int(mx.argmax(s).item())
+              agreements.append(int(vt == st))
+              kls.append(kl(v, s))
 
-                  agreements.append(int(vt == st))
+          print(f"\nSTUDENT = {name}")
+          print("MEAN AGREEMENT =", sum(agreements)/len(agreements))
+          print("MEAN KL =", sum(kls)/len(kls))
 
-                  kl = float(mx.sum(v * mx.log(v / s)).item())
-                  kls.append(kl)
+      print("\nEXPECTED THEOREM:")
+      print("KL: probs < topk < argmax")
+      print("Agreement: all can be high")
 
-              print(f"\nINTERFACE = {name}")
-              print("MEAN_AGREEMENT =", sum(agreements)/len(agreements))
-              print("MEAN_KL =", sum(kls)/len(kls))
-
-          print("\nEXPECTED RESULT:")
-          print("Agreement ~ similar")
-          print("KL: probs < topk < argmax")
-          PY
-
-      ############################################################
-      # DONE
-      ############################################################
-      - name: Done
-        run: echo "SEPARATION THEOREM TEST COMPLETE"
+      PY
+```
