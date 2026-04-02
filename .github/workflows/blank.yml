@@ -1,4 +1,4 @@
-name: dora-separation-theorem-ultra-verbose
+name: dora-distillation-attack-sim-grounded-ultra-verbose
 
 on:
   workflow_dispatch:
@@ -9,8 +9,52 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-      MODEL_ID: Qwen/Qwen2-0.5B
       HF_HOME: ${{ github.workspace }}/.hf-cache
+
+      # Base models used for local/open simulation.
+      TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
+      STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+
+      DATA_DIR: ${{ github.workspace }}/distill_data
+      ADAPTER_DIR: ${{ github.workspace }}/adapters/distilled
+      REPORT_DIR: ${{ github.workspace }}/reports
+      SCRIPT_DIR: ${{ github.workspace }}/scripts
+
+      MAX_NEW_TOKENS: "220"
+
+      # Stage 1 benchmark controls
+      BENCH_SEED_LIMIT: "24"
+      BENCH_MINE_LIMIT: "8"
+      HARD_VARIANTS_PER_PROMPT: "3"
+
+      # Stage 2 distillation attempts
+      ATTEMPT_MATRIX: |
+        [
+          {
+            "name": "attempt_a_mask_prompt_lr1e5_layers8",
+            "iters": 120,
+            "batch_size": 1,
+            "num_layers": 8,
+            "learning_rate": 1e-5,
+            "mask_prompt": true
+          },
+          {
+            "name": "attempt_b_mask_prompt_lr2e5_layers12",
+            "iters": 160,
+            "batch_size": 1,
+            "num_layers": 12,
+            "learning_rate": 2e-5,
+            "mask_prompt": true
+          },
+          {
+            "name": "attempt_c_no_mask_lr1e5_layers8",
+            "iters": 120,
+            "batch_size": 1,
+            "num_layers": 8,
+            "learning_rate": 1e-5,
+            "mask_prompt": false
+          }
+        ]
 
     steps:
       - name: Checkout
@@ -20,198 +64,730 @@ jobs:
         run: |
           echo "================ SYSTEM INFO ================"
           uname -a
-          python --version
+          sw_vers || true
+          sysctl -n machdep.cpu.brand_string || true
+          python3 --version
+          echo "PWD=$(pwd)"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "HF_HOME=${HF_HOME}"
+          echo "TEACHER_MODEL=${TEACHER_MODEL}"
+          echo "STUDENT_MODEL=${STUDENT_MODEL}"
+          echo "DATA_DIR=${DATA_DIR}"
+          echo "ADAPTER_DIR=${ADAPTER_DIR}"
+          echo "REPORT_DIR=${REPORT_DIR}"
+          echo "SCRIPT_DIR=${SCRIPT_DIR}"
+          echo "MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+          echo "BENCH_SEED_LIMIT=${BENCH_SEED_LIMIT}"
+          echo "BENCH_MINE_LIMIT=${BENCH_MINE_LIMIT}"
+          echo "HARD_VARIANTS_PER_PROMPT=${HARD_VARIANTS_PER_PROMPT}"
           echo "============================================="
 
       - name: Install Dependencies
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
-          pip install mlx mlx_lm
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "mlx-lm[train]" numpy
 
-      - name: Run Separation Theorem (REAL DISTILLATION)
+      - name: Prepare folders
         run: |
           set -euxo pipefail
-          python - <<'PY'
+          mkdir -p "${DATA_DIR}" "${ADAPTER_DIR}" "${REPORT_DIR}" "${SCRIPT_DIR}"
+          ls -la
+          echo "[OK] folders prepared"
+
+      - name: Write benchmark and distillation scripts
+        run: |
+          set -euxo pipefail
+
+          cat > "${SCRIPT_DIR}/stage1_benchmark.py" <<'PY'
+          import json
           import os
-          import sys
           import random
-          import platform
-          import mlx.core as mx
-          from mlx_lm import load
+          import re
+          import statistics
+          import traceback
+          from pathlib import Path
+
+          from mlx_lm import load, generate
 
           random.seed(0)
 
-          print("\n============================================================")
-          print("STEP 1: ENV + MODEL LOAD")
-          print("============================================================")
+          teacher_repo = os.environ["TEACHER_MODEL"]
+          student_repo = os.environ["STUDENT_MODEL"]
+          data_dir = Path(os.environ["DATA_DIR"])
+          report_dir = Path(os.environ["REPORT_DIR"])
+          max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "220"))
+          bench_seed_limit = int(os.environ.get("BENCH_SEED_LIMIT", "24"))
+          bench_mine_limit = int(os.environ.get("BENCH_MINE_LIMIT", "8"))
+          hard_variants_per_prompt = int(os.environ.get("HARD_VARIANTS_PER_PROMPT", "3"))
 
-          print("PYTHON =", sys.version)
-          print("PLATFORM =", platform.platform())
-          print("MODEL_ID =", os.environ.get("MODEL_ID"))
-          print("HF_HOME =", os.environ.get("HF_HOME"))
+          print("=" * 80)
+          print("STAGE 1 BENCHMARK: ULTRA VERBOSE TEACHER/STUDENT GAP ANALYSIS")
+          print("=" * 80)
+          print("teacher_repo =", teacher_repo)
+          print("student_repo =", student_repo)
+          print("data_dir =", data_dir)
+          print("report_dir =", report_dir)
+          print("max_new_tokens =", max_new_tokens)
+          print("bench_seed_limit =", bench_seed_limit)
+          print("bench_mine_limit =", bench_mine_limit)
+          print("hard_variants_per_prompt =", hard_variants_per_prompt)
 
-          model, tokenizer = load(os.environ.get("MODEL_ID"))
+          report_dir.mkdir(parents=True, exist_ok=True)
+          data_dir.mkdir(parents=True, exist_ok=True)
 
-          print("MODEL_LOADED =", type(model).__name__)
-          print("TOKENIZER_LOADED =", type(tokenizer).__name__)
+          print("\n[LOAD] teacher model")
+          teacher_model, teacher_tok = load(teacher_repo)
+          print("[LOAD OK] teacher model loaded")
 
-          def tokenize(text):
-              ids = tokenizer.encode(text)
-              if ids and isinstance(ids[0], list):
-                  ids = ids[0]
-              assert all(isinstance(x, int) for x in ids)
-              return ids
+          print("\n[LOAD] baseline student model")
+          student_model, student_tok = load(student_repo)
+          print("[LOAD OK] baseline student model loaded")
 
-          def forward_probs(prompt):
-              ids = tokenize(prompt)
-              x = mx.array([ids], dtype=mx.int32)
-              logits = model(x)[0, -1, :]
-              probs = mx.softmax(logits).astype(mx.float32)
+          def chat_prompt(tokenizer, user_text: str, system_text: str) -> str:
+              messages = [
+                  {"role": "system", "content": system_text},
+                  {"role": "user", "content": user_text},
+              ]
+              return tokenizer.apply_chat_template(
+                  messages,
+                  tokenize=False,
+                  add_generation_prompt=True,
+              )
 
-              print("\n[FORWARD PASS]")
-              print("PROMPT =", repr(prompt))
-              print("TOKEN_LEN =", len(ids))
-              print("VOCAB_SIZE =", probs.shape[0])
-              print("PROB_SUM =", float(mx.sum(probs).item()))
+          def generate_text(model, tokenizer, user_text: str, system_text: str) -> str:
+              prompt = chat_prompt(tokenizer, user_text, system_text)
+              out = generate(
+                  model,
+                  tokenizer,
+                  prompt=prompt,
+                  max_tokens=max_new_tokens,
+                  verbose=False,
+              )
+              return out.strip()
 
-              return probs
+          def norm_tokens(s: str):
+              return re.findall(r"[a-zA-Z0-9_]+", s.lower())
 
-          prompts = [
-              "Fix bug: def add(a,b): return a-b",
-              "Reverse string in Python",
-              "Multiply two numbers function",
-              "Fix division by zero",
-              "Sort a list ascending",
+          def token_f1(a: str, b: str) -> float:
+              aa = norm_tokens(a)
+              bb = norm_tokens(b)
+              if not aa or not bb:
+                  return 0.0
+              a_counts = {}
+              b_counts = {}
+              for t in aa:
+                  a_counts[t] = a_counts.get(t, 0) + 1
+              for t in bb:
+                  b_counts[t] = b_counts.get(t, 0) + 1
+              overlap = 0
+              for t, c in a_counts.items():
+                  overlap += min(c, b_counts.get(t, 0))
+              if overlap == 0:
+                  return 0.0
+              precision = overlap / len(bb)
+              recall = overlap / len(aa)
+              return 2 * precision * recall / max(precision + recall, 1e-12)
+
+          def length_ratio(a: str, b: str) -> float:
+              la = max(len(a), 1)
+              lb = max(len(b), 1)
+              return min(la, lb) / max(la, lb)
+
+          def exact_match(a: str, b: str) -> int:
+              return int(a.strip() == b.strip())
+
+          system_text = (
+              "You are a precise assistant. "
+              "Give concise final answers. "
+              "Do not reveal hidden chain-of-thought. "
+              "For coding tasks, provide the code first, then a brief explanation if needed."
+          )
+
+          seed_prompts = [
+              "Write a Python function that fixes an off-by-one bug in binary search.",
+              "Given a traceback showing KeyError in a dict lookup, explain the likely bug and patch it.",
+              "Write a regex in Python that extracts IPv4 addresses and show a small test.",
+              "Implement breadth-first search in Python and state the time complexity.",
+              "Given a failing unit test for a sort function, propose the minimal code fix.",
+              "Write a function that safely divides two numbers and handles zero division cleanly.",
+              "Explain how to parse CSV with quoted commas in Python and provide code.",
+              "Implement LRU cache behavior in Python using built-in data structures.",
+              "Refactor a quadratic duplicate-removal function into a linear-time version.",
+              "Write a small CLI in Python that reads JSON from stdin and prints one selected field.",
+              "Explain why a recursion error happens in a DFS implementation and provide an iterative fix.",
+              "Write a function to merge overlapping intervals and include a compact example.",
+              "Generate a SQL query that returns the latest order per customer.",
+              "Given an API timeout incident, propose retry logic with backoff in Python.",
+              "Write a Python function that normalizes whitespace and strips control characters.",
+              "Write a Python function that validates email-like strings using a pragmatic regex.",
+              "Patch a bug in code that mutates a list while iterating over it.",
+              "Write a function that groups words by anagram signature.",
+              "Implement Dijkstra's algorithm in Python with a priority queue.",
+              "Explain how to avoid SQL injection in a small Python example.",
+              "Write a parser that extracts timestamps from log lines.",
+              "Given flaky API behavior, show retry-with-jitter logic.",
+              "Write code to stream-read a large JSONL file line by line.",
+              "Design a robust function to deduplicate records by id while keeping newest timestamps.",
           ]
 
-          print("\n============================================================")
-          print("STEP 2: BUILD DATASET (TRUE TARGETS)")
-          print("============================================================")
+          seed_prompts = seed_prompts[:bench_seed_limit]
 
-          dataset = []
-          vocab_size = None
+          def ask_teacher_for_harder_variants(base_prompt: str, teacher_answer_text: str):
+              req = f"""
+          You are generating harder benchmark prompts for a student model.
 
-          for p in prompts:
-              v = forward_probs(p)
+          Original prompt:
+          {base_prompt}
 
-              if vocab_size is None:
-                  vocab_size = v.shape[0]
+          Teacher answer summary:
+          {teacher_answer_text[:700]}
 
-              argmax_target = mx.zeros_like(v)
-              top1 = int(mx.argmax(v).item())
-              argmax_target[top1] = 1.0
+          Create exactly {hard_variants_per_prompt} harder prompts that probe the SAME core capability.
+          Make them more specific, more failure-prone, or more edge-case heavy.
+          Return ONLY a numbered list.
+              """.strip()
 
-              k = 5
-              topk_ids = mx.argsort(v)[-k:]
-              topk_vals = v[topk_ids]
-              topk_vals = topk_vals / mx.sum(topk_vals)
+              raw = generate_text(teacher_model, teacher_tok, req, system_text)
+              lines = [x.strip() for x in raw.splitlines() if x.strip()]
+              variants = []
+              for line in lines:
+                  line = re.sub(r"^\d+[\).\s-]+", "", line).strip()
+                  if line:
+                      variants.append(line)
 
-              topk_target = mx.zeros_like(v)
-              topk_target[topk_ids] = topk_vals
+              out = []
+              seen = set()
+              for v in variants:
+                  if v not in seen:
+                      seen.add(v)
+                      out.append(v)
+                  if len(out) == hard_variants_per_prompt:
+                      break
 
-              probs_target = v
+              if len(out) < hard_variants_per_prompt:
+                  fallback = [
+                      base_prompt + " Include edge cases and tests.",
+                      base_prompt + " Constrain the solution to linear or near-linear complexity.",
+                      base_prompt + " Add one realistic production caveat.",
+                      base_prompt + " Add failure handling and short tests.",
+                  ]
+                  for v in fallback:
+                      if v not in seen:
+                          out.append(v)
+                      if len(out) == hard_variants_per_prompt:
+                          break
+              return out
 
-              print("\n[DATA POINT]")
-              print("PROMPT =", p)
-              print("TOP1_ID =", top1)
-              print("TOPK_IDS =", [int(x) for x in topk_ids.tolist()])
+          def safe_eval(prompt: str, source: str, parent_prompt: str | None = None):
+              row = {
+                  "prompt": prompt,
+                  "source": source,
+                  "parent_prompt": parent_prompt,
+                  "teacher_output": "",
+                  "student_output": "",
+                  "teacher_error": None,
+                  "student_error": None,
+                  "token_f1": 0.0,
+                  "length_ratio": 0.0,
+                  "exact_match": 0,
+              }
 
-              dataset.append((p, argmax_target, topk_target, probs_target))
+              print("\n" + "-" * 80)
+              print("[EVAL]")
+              print("SOURCE =", source)
+              print("PARENT_PROMPT =", parent_prompt)
+              print("PROMPT =", prompt)
 
-          print("DATASET_SIZE =", len(dataset))
-          print("VOCAB_SIZE =", vocab_size)
+              try:
+                  teacher_output = generate_text(teacher_model, teacher_tok, prompt, system_text)
+                  row["teacher_output"] = teacher_output
+                  print("[TEACHER OK] chars =", len(teacher_output))
+              except Exception as e:
+                  row["teacher_error"] = repr(e)
+                  print("[TEACHER ERROR]", repr(e))
+                  print(traceback.format_exc())
 
-          print("\n============================================================")
-          print("STEP 3: STUDENT DEFINITION")
-          print("============================================================")
+              try:
+                  student_output = generate_text(student_model, student_tok, prompt, system_text)
+                  row["student_output"] = student_output
+                  print("[STUDENT OK] chars =", len(student_output))
+              except Exception as e:
+                  row["student_error"] = repr(e)
+                  print("[STUDENT ERROR]", repr(e))
+                  print(traceback.format_exc())
 
-          class Student:
-              def __init__(self, name):
-                  self.name = name
-                  self.logits = mx.zeros(vocab_size)
+              if row["teacher_output"] and row["student_output"]:
+                  row["token_f1"] = round(token_f1(row["teacher_output"], row["student_output"]), 6)
+                  row["length_ratio"] = round(length_ratio(row["teacher_output"], row["student_output"]), 6)
+                  row["exact_match"] = exact_match(row["teacher_output"], row["student_output"])
 
-              def probs(self):
-                  return mx.softmax(self.logits)
+              print("[METRICS] token_f1 =", row["token_f1"])
+              print("[METRICS] length_ratio =", row["length_ratio"])
+              print("[METRICS] exact_match =", row["exact_match"])
 
-              def update(self, grad, lr=0.5):
-                  self.logits = self.logits - lr * grad
+              return row
 
-          def kl(p, q, eps=1e-12):
-              p = mx.maximum(p, eps)
-              q = mx.maximum(q, eps)
-              return float(mx.sum(p * mx.log(p / q)).item())
+          rows = []
+          print("\n" + "=" * 80)
+          print("PHASE 1A: BASE SEED BENCHMARK")
+          print("=" * 80)
 
-          def kl_grad(student_probs, target_probs):
-              return student_probs - target_probs
+          for idx, prompt in enumerate(seed_prompts, start=1):
+              print(f"\n[SEED {idx}/{len(seed_prompts)}]")
+              rows.append(safe_eval(prompt, source="seed"))
 
-          students = {
-              "argmax": Student("argmax"),
-              "topk": Student("topk"),
-              "probs": Student("probs"),
+          successful_seed_rows = [r for r in rows if r["teacher_output"] and r["student_output"]]
+          successful_seed_rows_sorted = sorted(successful_seed_rows, key=lambda r: r["token_f1"])
+          weak_rows = successful_seed_rows_sorted[:bench_mine_limit]
+
+          print("\n" + "=" * 80)
+          print("PHASE 1B: HARD PROMPT MINING FROM WEAKEST STUDENT CASES")
+          print("=" * 80)
+          print("weak_seed_count =", len(weak_rows))
+
+          for idx, r in enumerate(weak_rows, start=1):
+              base_prompt = r["prompt"]
+              teacher_output = r["teacher_output"]
+              print(f"\n[WEAK CASE {idx}/{len(weak_rows)}]")
+              print("BASE_PROMPT =", base_prompt)
+              print("BASE_TOKEN_F1 =", r["token_f1"])
+
+              harder = ask_teacher_for_harder_variants(base_prompt, teacher_output)
+              print("HARDER_PROMPTS =", harder)
+
+              for hp in harder:
+                  rows.append(safe_eval(hp, source="hard_mined", parent_prompt=base_prompt))
+
+          print("\n" + "=" * 80)
+          print("PHASE 1C: BUILD DISTILLATION DATASET")
+          print("=" * 80)
+
+          records = []
+          for r in rows:
+              if r["teacher_output"]:
+                  records.append({
+                      "prompt": r["prompt"],
+                      "completion": r["teacher_output"],
+                      "meta": {
+                          "source": r["source"],
+                          "parent_prompt": r["parent_prompt"],
+                          "token_f1": r["token_f1"],
+                          "length_ratio": r["length_ratio"],
+                          "exact_match": r["exact_match"],
+                      },
+                  })
+
+          dedup = {}
+          for item in records:
+              dedup[item["prompt"]] = item
+          records = list(dedup.values())
+          random.shuffle(records)
+
+          n = len(records)
+          n_train = max(int(n * 0.8), 1)
+          n_valid = max(int(n * 0.1), 1)
+          train = records[:n_train]
+          valid = records[n_train:n_train + n_valid]
+          test = records[n_train + n_valid:]
+
+          if not test:
+              test = valid[-2:] if len(valid) >= 2 else train[-2:]
+
+          def write_jsonl(path: Path, items):
+              with path.open("w", encoding="utf-8") as f:
+                  for item in items:
+                      f.write(json.dumps({
+                          "prompt": item["prompt"],
+                          "completion": item["completion"],
+                      }, ensure_ascii=False) + "\n")
+
+          write_jsonl(data_dir / "train.jsonl", train)
+          write_jsonl(data_dir / "valid.jsonl", valid)
+          write_jsonl(data_dir / "test.jsonl", test)
+
+          ok_rows = [r for r in rows if r["teacher_output"] and r["student_output"]]
+          fail_rows = [r for r in rows if (not r["teacher_output"]) or (not r["student_output"])]
+
+          summary = {
+              "teacher_model": teacher_repo,
+              "student_model": student_repo,
+              "max_new_tokens": max_new_tokens,
+              "seed_prompt_count": len(seed_prompts),
+              "all_eval_rows": len(rows),
+              "successful_eval_rows": len(ok_rows),
+              "failed_eval_rows": len(fail_rows),
+              "dataset_total_after_teacher_only_filter_and_dedup": len(records),
+              "num_train": len(train),
+              "num_valid": len(valid),
+              "num_test": len(test),
+              "mean_token_f1": round(statistics.mean([r["token_f1"] for r in ok_rows]), 6) if ok_rows else None,
+              "median_token_f1": round(statistics.median([r["token_f1"] for r in ok_rows]), 6) if ok_rows else None,
+              "mean_length_ratio": round(statistics.mean([r["length_ratio"] for r in ok_rows]), 6) if ok_rows else None,
+              "exact_match_rate": round(sum(r["exact_match"] for r in ok_rows) / len(ok_rows), 6) if ok_rows else None,
+              "weakest_cases": [
+                  {
+                      "prompt": r["prompt"],
+                      "source": r["source"],
+                      "token_f1": r["token_f1"],
+                  }
+                  for r in sorted(ok_rows, key=lambda x: x["token_f1"])[:10]
+              ],
+              "strongest_cases": [
+                  {
+                      "prompt": r["prompt"],
+                      "source": r["source"],
+                      "token_f1": r["token_f1"],
+                  }
+                  for r in sorted(ok_rows, key=lambda x: x["token_f1"], reverse=True)[:10]
+              ],
           }
 
-          print("STUDENTS =", list(students.keys()))
+          with (report_dir / "stage1_rows.json").open("w", encoding="utf-8") as f:
+              json.dump(rows, f, indent=2, ensure_ascii=False)
 
-          print("\n============================================================")
-          print("STEP 4: TRAINING LOOP")
-          print("============================================================")
+          with (report_dir / "stage1_summary.json").open("w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, ensure_ascii=False)
 
-          epochs = 200
+          with (report_dir / "stage1_summary.txt").open("w", encoding="utf-8") as f:
+              f.write("STAGE 1 SUMMARY\n")
+              f.write("=" * 80 + "\n")
+              for k, v in summary.items():
+                  f.write(f"{k}: {v}\n")
 
-          for epoch in range(epochs):
-              epoch_loss = {k: 0.0 for k in students}
-
-              for prompt, a_t, t_t, p_t in dataset:
-                  for name, student in students.items():
-                      sp = student.probs()
-
-                      if name == "argmax":
-                          target = a_t
-                      elif name == "topk":
-                          target = t_t
-                      else:
-                          target = p_t
-
-                      loss = kl(target, sp)
-                      grad = kl_grad(sp, target)
-
-                      student.update(grad, lr=0.5)
-                      epoch_loss[name] += loss
-
-              if epoch % 50 == 0 or epoch == epochs - 1:
-                  print("\n[EPOCH SUMMARY]", epoch)
-                  for name in students:
-                      print(f"{name}_LOSS =", epoch_loss[name])
-
-          print("\n============================================================")
-          print("STEP 5: FINAL EVALUATION")
-          print("============================================================")
-
-          for name, student in students.items():
-              agreements = []
-              kls = []
-
-              for prompt, a_t, t_t, p_t in dataset:
-                  victim = p_t
-                  student_probs = student.probs()
-
-                  vt = int(mx.argmax(victim).item())
-                  st = int(mx.argmax(student_probs).item())
-
-                  agreements.append(int(vt == st))
-                  kls.append(kl(victim, student_probs))
-
-              print("\n==============================")
-              print("STUDENT =", name)
-              print("==============================")
-              print("MEAN_AGREEMENT =", sum(agreements) / len(agreements))
-              print("MEAN_KL =", sum(kls) / len(kls))
-
-          print("\n============================================================")
-          print("EXPECTED RESULT (SEPARATION THEOREM)")
-          print("============================================================")
-          print("Agreement: all similar or high")
-          print("KL ordering: probs < topk < argmax")
-          print("============================================================")
+          print("\n" + "=" * 80)
+          print("STAGE 1 FINAL SUMMARY")
+          print("=" * 80)
+          print(json.dumps(summary, indent=2))
           PY
+
+          cat > "${SCRIPT_DIR}/stage2_attempts.py" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import traceback
+          from pathlib import Path
+
+          data_dir = Path(os.environ["DATA_DIR"])
+          adapter_root = Path(os.environ["ADAPTER_DIR"])
+          report_dir = Path(os.environ["REPORT_DIR"])
+          student_model = os.environ["STUDENT_MODEL"]
+          attempts = json.loads(os.environ["ATTEMPT_MATRIX"])
+
+          report_dir.mkdir(parents=True, exist_ok=True)
+          adapter_root.mkdir(parents=True, exist_ok=True)
+
+          print("=" * 80)
+          print("STAGE 2 DISTILLATION ATTEMPTS: ULTRA VERBOSE")
+          print("=" * 80)
+          print("student_model =", student_model)
+          print("data_dir =", data_dir)
+          print("adapter_root =", adapter_root)
+          print("attempt_count =", len(attempts))
+
+          def run_cmd(cmd, log_path: Path):
+              print("\n[RUN CMD]")
+              print(" ".join(cmd))
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              log_path.write_text(
+                  "COMMAND:\n"
+                  + " ".join(cmd)
+                  + "\n\nSTDOUT:\n"
+                  + proc.stdout
+                  + "\n\nSTDERR:\n"
+                  + proc.stderr,
+                  encoding="utf-8",
+              )
+              print("[EXIT CODE]", proc.returncode)
+              return proc.returncode, proc.stdout, proc.stderr
+
+          def parse_eval_metric(text: str):
+              patterns = [
+                  r"Test loss\s+([0-9.]+)",
+                  r"test loss\s*[:=]\s*([0-9.]+)",
+                  r"Loss\s+([0-9.]+)",
+                  r"loss\s*[:=]\s*([0-9.]+)",
+                  r"Test perplexity\s+([0-9.]+)",
+                  r"perplexity\s*[:=]\s*([0-9.]+)",
+              ]
+              out = {}
+              for p in patterns:
+                  m = re.search(p, text)
+                  if m:
+                      out[p] = float(m.group(1))
+              return out
+
+          results = []
+
+          baseline_log = report_dir / "stage2_baseline_test.log"
+          baseline_cmd = [
+              "python3", "-m", "mlx_lm.lora",
+              "--model", student_model,
+              "--data", str(data_dir),
+              "--test",
+          ]
+          baseline_rc, baseline_stdout, baseline_stderr = run_cmd(baseline_cmd, baseline_log)
+          baseline_metrics = parse_eval_metric(baseline_stdout + "\n" + baseline_stderr)
+
+          baseline_result = {
+              "name": "baseline_student_pre_distill",
+              "phase": "baseline_eval",
+              "returncode": baseline_rc,
+              "metrics": baseline_metrics,
+              "log_path": str(baseline_log),
+          }
+          results.append(baseline_result)
+
+          for attempt in attempts:
+              name = attempt["name"]
+              iters = str(attempt["iters"])
+              batch_size = str(attempt["batch_size"])
+              num_layers = str(attempt["num_layers"])
+              learning_rate = str(attempt["learning_rate"])
+              mask_prompt = bool(attempt["mask_prompt"])
+
+              print("\n" + "=" * 80)
+              print("ATTEMPT START")
+              print("=" * 80)
+              print("name =", name)
+              print("iters =", iters)
+              print("batch_size =", batch_size)
+              print("num_layers =", num_layers)
+              print("learning_rate =", learning_rate)
+              print("mask_prompt =", mask_prompt)
+
+              adapter_path = adapter_root / name
+              adapter_path.mkdir(parents=True, exist_ok=True)
+
+              train_cmd = [
+                  "python3", "-m", "mlx_lm.lora",
+                  "--model", student_model,
+                  "--train",
+                  "--data", str(data_dir),
+                  "--adapter-path", str(adapter_path),
+                  "--iters", iters,
+                  "--batch-size", batch_size,
+                  "--num-layers", num_layers,
+                  "--learning-rate", learning_rate,
+              ]
+              if mask_prompt:
+                  train_cmd.append("--mask-prompt")
+
+              train_log = report_dir / f"{name}_train.log"
+              train_rc, train_stdout, train_stderr = run_cmd(train_cmd, train_log)
+
+              test_cmd = [
+                  "python3", "-m", "mlx_lm.lora",
+                  "--model", student_model,
+                  "--adapter-path", str(adapter_path),
+                  "--data", str(data_dir),
+                  "--test",
+              ]
+              if mask_prompt:
+                  test_cmd.append("--mask-prompt")
+
+              test_log = report_dir / f"{name}_test.log"
+              test_rc, test_stdout, test_stderr = run_cmd(test_cmd, test_log)
+              test_metrics = parse_eval_metric(test_stdout + "\n" + test_stderr)
+
+              result = {
+                  "name": name,
+                  "phase": "train_and_eval",
+                  "config": attempt,
+                  "adapter_path": str(adapter_path),
+                  "train_returncode": train_rc,
+                  "test_returncode": test_rc,
+                  "train_log_path": str(train_log),
+                  "test_log_path": str(test_log),
+                  "metrics": test_metrics,
+                  "status": "ok" if train_rc == 0 and test_rc == 0 else "failed",
+              }
+
+              if train_rc != 0 or test_rc != 0:
+                  result["error"] = "one_or_more_commands_failed"
+
+              results.append(result)
+
+          def score_key(item):
+              metrics = item.get("metrics", {})
+              vals = [v for _, v in metrics.items()]
+              if not vals:
+                  return float("inf")
+              return min(vals)
+
+          attempt_only = [r for r in results if r.get("phase") == "train_and_eval"]
+          attempt_only_sorted = sorted(attempt_only, key=score_key)
+
+          summary = {
+              "baseline": baseline_result,
+              "attempts": results,
+              "best_attempt_by_lowest_parsed_metric": attempt_only_sorted[0]["name"] if attempt_only_sorted else None,
+              "successful_attempt_count": sum(1 for r in attempt_only if r["status"] == "ok"),
+              "failed_attempt_count": sum(1 for r in attempt_only if r["status"] != "ok"),
+          }
+
+          (report_dir / "stage2_attempts_results.json").write_text(
+              json.dumps(results, indent=2), encoding="utf-8"
+          )
+          (report_dir / "stage2_summary.json").write_text(
+              json.dumps(summary, indent=2), encoding="utf-8"
+          )
+
+          with (report_dir / "stage2_summary.txt").open("w", encoding="utf-8") as f:
+              f.write("STAGE 2 SUMMARY\n")
+              f.write("=" * 80 + "\n")
+              f.write(json.dumps(summary, indent=2))
+              f.write("\n")
+
+          print("\n" + "=" * 80)
+          print("STAGE 2 FINAL SUMMARY")
+          print("=" * 80)
+          print(json.dumps(summary, indent=2))
+          PY
+
+          cat > "${SCRIPT_DIR}/qualitative_compare.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from mlx_lm import load, generate
+
+          data_dir = Path(os.environ["DATA_DIR"])
+          report_dir = Path(os.environ["REPORT_DIR"])
+          student_repo = os.environ["STUDENT_MODEL"]
+          max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "220"))
+
+          summary_path = report_dir / "stage2_summary.json"
+          if not summary_path.exists():
+              raise SystemExit("Missing stage2_summary.json")
+
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          best_name = summary.get("best_attempt_by_lowest_parsed_metric")
+          if not best_name:
+              raise SystemExit("No successful attempt found")
+
+          adapter_path = Path(os.environ["ADAPTER_DIR"]) / best_name
+
+          print("=" * 80)
+          print("QUALITATIVE COMPARE")
+          print("=" * 80)
+          print("best_attempt =", best_name)
+          print("adapter_path =", adapter_path)
+
+          test_path = data_dir / "test.jsonl"
+          samples = []
+          with test_path.open("r", encoding="utf-8") as f:
+              for line in f:
+                  samples.append(json.loads(line))
+          samples = samples[:5]
+
+          print("[LOAD] base student")
+          base_model, base_tok = load(student_repo)
+
+          print("[LOAD] tuned student")
+          tuned_model, tuned_tok = load(student_repo, adapter_path=str(adapter_path))
+
+          def promptify(tok, user_text):
+              msgs = [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a precise assistant. "
+                          "Give concise final answers. "
+                          "For coding tasks, provide the code first, then a brief explanation if needed."
+                      ),
+                  },
+                  {"role": "user", "content": user_text},
+              ]
+              return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+          def answer(model, tok, prompt_text):
+              return generate(
+                  model,
+                  tok,
+                  prompt=promptify(tok, prompt_text),
+                  max_tokens=max_new_tokens,
+                  verbose=False,
+              ).strip()
+
+          blocks = []
+          for i, ex in enumerate(samples, start=1):
+              prompt = ex["prompt"]
+              teacher = ex["completion"]
+              base = answer(base_model, base_tok, prompt)
+              tuned = answer(tuned_model, tuned_tok, prompt)
+
+              block = {
+                  "sample_index": i,
+                  "prompt": prompt,
+                  "teacher_target": teacher,
+                  "base_student": base,
+                  "distilled_student": tuned,
+              }
+              blocks.append(block)
+
+              print("\n" + "=" * 80)
+              print(f"SAMPLE {i}")
+              print("=" * 80)
+              print("PROMPT:\n", prompt)
+              print("\nTEACHER TARGET:\n", teacher[:1200])
+              print("\nBASE STUDENT:\n", base[:1200])
+              print("\nDISTILLED STUDENT:\n", tuned[:1200])
+
+          (report_dir / "qualitative_compare.json").write_text(
+              json.dumps(blocks, indent=2, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+
+          echo "[OK] scripts written"
+          ls -la "${SCRIPT_DIR}"
+
+      - name: Stage 1 benchmark and dataset build
+        run: |
+          set -euxo pipefail
+          python3 "${SCRIPT_DIR}/stage1_benchmark.py" | tee "${REPORT_DIR}/stage1_console.log"
+
+      - name: Show Stage 1 summary
+        run: |
+          set -euxo pipefail
+          echo "================ STAGE 1 SUMMARY TXT ================"
+          cat "${REPORT_DIR}/stage1_summary.txt"
+          echo
+          echo "================ DATASET FILE COUNTS ================"
+          echo "TRAIN LINES: $(wc -l < "${DATA_DIR}/train.jsonl")"
+          echo "VALID LINES: $(wc -l < "${DATA_DIR}/valid.jsonl")"
+          echo "TEST  LINES: $(wc -l < "${DATA_DIR}/test.jsonl")"
+          echo
+          echo "================ TOP OF TRAIN FILE ================"
+          head -n 3 "${DATA_DIR}/train.jsonl" || true
+
+      - name: Stage 2 multiple distillation attempts
+        run: |
+          set -euxo pipefail
+          python3 "${SCRIPT_DIR}/stage2_attempts.py" | tee "${REPORT_DIR}/stage2_console.log"
+
+      - name: Show Stage 2 summary
+        run: |
+          set -euxo pipefail
+          echo "================ STAGE 2 SUMMARY TXT ================"
+          cat "${REPORT_DIR}/stage2_summary.txt"
+          echo
+          echo "================ AVAILABLE ADAPTERS ================"
+          find "${ADAPTER_DIR}" -maxdepth 2 -type f | sort || true
+
+      - name: Qualitative comparison using best successful attempt
+        run: |
+          set -euxo pipefail
+          python3 "${SCRIPT_DIR}/qualitative_compare.py" | tee "${REPORT_DIR}/qualitative_console.log"
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-distillation-attack-sim-grounded-ultra-verbose
+          path: |
+            ${{ env.DATA_DIR }}
+            ${{ env.ADAPTER_DIR }}
+            ${{ env.REPORT_DIR }}
+            ${{ env.SCRIPT_DIR }}
