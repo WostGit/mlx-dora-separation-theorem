@@ -1,0 +1,225 @@
+name: mlx-dora-separation-theorem
+
+on:
+workflow_dispatch:
+
+jobs:
+run:
+runs-on: macos-latest
+
+```
+env:
+  PYTHONUNBUFFERED: 1
+  MODEL_ID: Qwen/Qwen2-0.5B
+
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
+
+  - name: Setup Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
+
+  - name: Install deps
+    run: |
+      set -euxo pipefail
+      python -m pip install --upgrade pip
+      pip install mlx mlx-lm numpy
+
+  - name: Build datasets from victim (ULTRA VERBOSE)
+    run: |
+      set -euxo pipefail
+      python - << 'PY'
+      import os, json, math
+      import mlx.core as mx
+      from mlx_lm import load
+
+      print("==== LOADING MODEL ====")
+      model, tokenizer = load(os.environ["MODEL_ID"])
+
+      PROMPTS = [
+          "The capital of France is",
+          "2 + 2 =",
+          "The opposite of hot is",
+          "The largest planet is",
+          "A triangle has how many sides?",
+          "Water freezes at",
+          "The color of the sky is",
+          "Fire is"
+      ]
+
+      os.makedirs("data", exist_ok=True)
+
+      def tokenize(text):
+          return tokenizer.encode(text)
+
+      def softmax(x):
+          return mx.softmax(x, axis=-1)
+
+      def topk_view(probs, k=5):
+          idx = mx.argsort(probs)[-k:]
+          idx = idx[::-1]
+          vals = probs[idx]
+          vals = vals / mx.sum(vals)
+          out = mx.zeros_like(probs)
+          for i in range(k):
+              out[int(idx[i].item())] = vals[i]
+          return out
+
+      def argmax_view(probs):
+          idx = int(mx.argmax(probs).item())
+          out = mx.zeros_like(probs)
+          out[idx] = 1.0
+          return out
+
+      datasets = {
+          "argmax": [],
+          "topk": [],
+          "probs": []
+      }
+
+      print("==== BUILDING DATASETS ====")
+
+      for p in PROMPTS:
+          print("\nPROMPT:", p)
+          ids = tokenize(p)
+          x = mx.array([ids], dtype=mx.int32)
+
+          logits = model(x)
+          logits = logits[0, -1, :]
+          probs = softmax(logits).astype(mx.float32)
+
+          print("PROBS_SUM:", float(mx.sum(probs).item()))
+
+          views = {
+              "argmax": argmax_view(probs),
+              "topk": topk_view(probs),
+              "probs": probs
+          }
+
+          for k, v in views.items():
+              # compress to top-50 support for stability
+              idx = mx.argsort(probs)[-50:]
+              idx = idx[::-1]
+
+              support_probs = v[idx]
+              support_probs = support_probs / mx.sum(support_probs)
+
+              datasets[k].append({
+                  "prompt": p,
+                  "completion": json.dumps({
+                      "ids": [int(i.item()) for i in idx],
+                      "probs": [float(x) for x in support_probs.tolist()]
+                  })
+              })
+
+      for k, data in datasets.items():
+          path = f"data/{k}"
+          os.makedirs(path, exist_ok=True)
+
+          with open(f"{path}/train.jsonl", "w") as f:
+              for row in data:
+                  f.write(json.dumps(row) + "\n")
+
+          print(f"DATASET {k} SIZE:", len(data))
+
+      print("==== DATA BUILD COMPLETE ====")
+      PY
+
+  - name: Train DoRA students (3 interfaces)
+    run: |
+      set -euxo pipefail
+
+      for iface in argmax topk probs; do
+        echo "===== TRAINING $iface ====="
+
+        python -m mlx_lm.lora \
+          --model $MODEL_ID \
+          --train \
+          --data data/$iface \
+          --fine-tune-type dora \
+          --mask-prompt \
+          --batch-size 1 \
+          --iters 60 \
+          --steps-per-report 1 \
+          --save-every 30 \
+          --adapter-path adapters_$iface
+
+      done
+
+  - name: Evaluate separation theorem
+    run: |
+      set -euxo pipefail
+      python - << 'PY'
+      import os, math
+      import mlx.core as mx
+      from mlx_lm import load
+
+      print("==== LOADING VICTIM ====")
+      victim, tok = load(os.environ["MODEL_ID"])
+
+      PROMPTS = [
+          "The capital of France is",
+          "2 + 2 =",
+          "The opposite of hot is",
+          "The largest planet is",
+      ]
+
+      def kl(p, q):
+          eps = 1e-9
+          p = mx.maximum(p, eps)
+          q = mx.maximum(q, eps)
+          return float(mx.sum(p * mx.log(p / q)).item())
+
+      results = {}
+
+      for iface in ["argmax", "topk", "probs"]:
+          print("\n===== EVAL", iface, "=====")
+
+          student, _ = load(
+              os.environ["MODEL_ID"],
+              adapter_path=f"adapters_{iface}"
+          )
+
+          agreements = []
+          kls = []
+
+          for p in PROMPTS:
+              ids = tok.encode(p)
+              x = mx.array([ids], dtype=mx.int32)
+
+              v_logits = victim(x)[0, -1, :]
+              s_logits = student(x)[0, -1, :]
+
+              v = mx.softmax(v_logits).astype(mx.float32)
+              s = mx.softmax(s_logits).astype(mx.float32)
+
+              v_top = int(mx.argmax(v).item())
+              s_top = int(mx.argmax(s).item())
+
+              agreement = int(v_top == s_top)
+              kld = kl(v, s)
+
+              print("\nPROMPT:", p)
+              print("AGREEMENT:", agreement)
+              print("KL:", kld)
+
+              agreements.append(agreement)
+              kls.append(kld)
+
+          mean_agree = sum(agreements) / len(agreements)
+          mean_kl = sum(kls) / len(kls)
+
+          results[iface] = (mean_agree, mean_kl)
+
+      print("\n==== FINAL SUMMARY ====")
+      print("interface agreement kl")
+
+      for k, (a, klv) in results.items():
+          print(k, a, klv)
+
+      print("\nSEPARATION CHECK:")
+      print("If agreement similar but KL differs -> theorem supported")
+      PY
+```
