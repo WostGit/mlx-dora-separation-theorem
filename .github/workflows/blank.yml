@@ -11,9 +11,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
       HF_HOME: ${{ github.workspace }}/.hf-cache
 
-      # Open/local simulation only.
-      # Public Qwen benchmarks show a real size gap between these classes of models,
-      # especially on coding / reasoning tasks; this workflow benchmarks locally first.
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
 
@@ -24,28 +21,43 @@ jobs:
 
       MAX_NEW_TOKENS: "220"
       BENCH_MAX_NEW_TOKENS: "180"
+      VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Create virtual environment
+        run: |
+          set -euxo pipefail
+          python -m venv "${VENV_DIR}"
+          "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+
       - name: System Info
         run: |
+          set -euxo pipefail
           echo "================ SYSTEM INFO ================"
           uname -a
           sw_vers || true
-          python3 --version
+          python --version
+          "${VENV_DIR}/bin/python" --version
           echo "WORKSPACE = $GITHUB_WORKSPACE"
           echo "HF_HOME   = $HF_HOME"
           echo "TEACHER   = $TEACHER_MODEL"
           echo "STUDENT   = $STUDENT_MODEL"
+          echo "VENV_DIR  = $VENV_DIR"
           echo "============================================="
 
       - name: Install Dependencies
         run: |
           set -euxo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install "mlx-lm[train]" numpy
+          "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
       - name: Stage 1 - Build benchmark suite and run ultra verbose teacher-student gap analysis
         run: |
@@ -330,7 +342,7 @@ jobs:
               print(row["id"], row["token_f1"], row["prompt"])
           PY
 
-          python3 scripts/stage1_benchmark.py | tee "${SUMMARY_DIR}/stage1_benchmark_console.log"
+          "${VENV_DIR}/bin/python" scripts/stage1_benchmark.py | tee "${SUMMARY_DIR}/stage1_benchmark_console.log"
 
       - name: Stage 1 - Show benchmark summary
         run: |
@@ -540,7 +552,6 @@ jobs:
               t0 = teacher_completion(prompt, "direct")
               variants = ask_teacher_for_variants(prompt, t0, "burst")
 
-              # keep the seed
               s0 = student_completion(prompt, "direct")
               f10 = token_f1(t0, s0)
               strategies["attempt_b_bursty_prompt_families"]["records"].append({
@@ -640,7 +651,12 @@ jobs:
               if not valid:
                   valid = train[-2:] if len(train) >= 2 else train[:]
 
-              test = heldout if heldout else valid[-4:] if len(valid) >= 4 else train[-4:]
+              if heldout:
+                  test = heldout
+              elif len(valid) >= 4:
+                  test = valid[-4:]
+              else:
+                  test = train[-4:]
 
               write_jsonl(strategy_dir / "train.jsonl", train)
               write_jsonl(strategy_dir / "valid.jsonl", valid)
@@ -655,7 +671,7 @@ jobs:
                   "num_test": len(test),
                   "train_preview_prompts": [x["prompt"] for x in train[:5]],
                   "test_preview_prompts": [x["prompt"] for x in test[:5]],
-                }
+              }
               (strategy_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
               print("\n" + "-" * 80)
@@ -664,7 +680,7 @@ jobs:
               print("-" * 80)
           PY
 
-          python3 scripts/stage2_build_datasets.py | tee "${SUMMARY_DIR}/stage2_dataset_build_console.log"
+          "${VENV_DIR}/bin/python" scripts/stage2_build_datasets.py | tee "${SUMMARY_DIR}/stage2_dataset_build_console.log"
 
       - name: Stage 2 - Show strategy manifests
         run: |
@@ -687,6 +703,7 @@ jobs:
           cat > scripts/run_dora_attempts.sh <<'SH'
           set -euxo pipefail
 
+          PYTHON="${VENV_DIR}/bin/python"
           STUDENT_MODEL="${STUDENT_MODEL}"
           STRATEGY_ROOT="${STRATEGY_ROOT}"
           SUMMARY_DIR="${SUMMARY_DIR}"
@@ -704,13 +721,13 @@ jobs:
             echo "########################################################################"
 
             echo "[1/4] Baseline test before DoRA"
-            python3 -m mlx_lm.lora \
+            "${PYTHON}" -m mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --data "${strategy_dir}" \
               --test | tee "${strategy_dir}/baseline_test.log"
 
             echo "[2/4] DoRA training"
-            python3 -m mlx_lm.lora \
+            "${PYTHON}" -m mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --train \
               --data "${strategy_dir}" \
@@ -723,38 +740,141 @@ jobs:
               --mask-prompt | tee "${strategy_dir}/train_dora.log"
 
             echo "[3/4] Adapted test after DoRA"
-            python3 -m mlx_lm.lora \
+            "${PYTHON}" -m mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --adapter-path "${adapter_dir}" \
               --data "${strategy_dir}" \
               --test | tee "${strategy_dir}/adapted_test.log"
 
-            echo "[4/4] Extract metrics and finalize"
-            python3 - "${strategy_dir}" "${strategy_name}" "${SUMMARY_DIR}/attempt_results.tsv" <<'PY'
-          import sys
-          import re
-          from pathlib import Path
+            echo "[4/4] Extract coarse metrics"
+            "${PYTHON}" - "${strategy_dir}" "${strategy_name}" "${SUMMARY_DIR}/attempt_results.tsv" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-          strategy_dir = Path(sys.argv[1])
-          strategy_name = sys.argv[2]
-          out_tsv = Path(sys.argv[3])
+strategy_dir = Path(sys.argv[1])
+strategy_name = sys.argv[2]
+out_tsv = Path(sys.argv[3])
 
-          def extract_metric(log_path: Path):
-              if not log_path.exists():
-                  return "N/A"
-              txt = log_path.read_text(encoding="utf-8", errors="ignore")
-              # Captures MLX test outputs like "test loss 2.45" or "test perplexity 11.5"
-              matches = re.findall(r"(?:loss|ppl|perplexity)[\s:]+([\d.]+)", txt.lower())
-              return matches[-1] if matches else "N/A"
+def extract_value(path: Path):
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    candidates = []
+    for line in text.splitlines():
+        lower = line.lower()
+        if any(key in lower for key in ["test", "loss", "ppl", "perplexity"]):
+            nums = re.findall(r"[-+]?\d*\.\d+|\d+", line)
+            if nums:
+                try:
+                    candidates.append((line, float(nums[-1])))
+                except Exception:
+                    pass
+    if candidates:
+        return candidates[-1][0], candidates[-1][1]
+    return "NO_PARSE", -1.0
 
-          baseline_val = extract_metric(strategy_dir / "baseline_test.log")
-          adapted_val = extract_metric(strategy_dir / "adapted_test.log")
+b_phase, b_val = extract_value(strategy_dir / "baseline_test.log")
+a_phase, a_val = extract_value(strategy_dir / "adapted_test.log")
+status = "improved" if (a_val >= 0 and b_val >= 0 and a_val < b_val) else "unknown_or_not_improved"
 
-          with open(out_tsv, "a", encoding="utf-8") as f:
-              f.write(f"{strategy_name}\ttest\t{baseline_val}\ttest\t{adapted_val}\tsuccess\n")
-          PY
-
+with out_tsv.open("a", encoding="utf-8") as f:
+    f.write(f"{strategy_name}\t{b_phase}\t{b_val}\t{a_phase}\t{a_val}\t{status}\n")
+PY
           done
           SH
 
-          bash scripts/run_dora_attempts.sh
+          bash scripts/run_dora_attempts.sh | tee "${SUMMARY_DIR}/stage2_dora_attempts_console.log"
+
+      - name: Stage 2 - Qualitative comparison for each DoRA attempt
+        run: |
+          set -euxo pipefail
+          mkdir -p scripts
+
+          cat > scripts/qualitative_compare.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from mlx_lm import load, generate
+
+          strategy_root = Path(os.environ["STRATEGY_ROOT"])
+          student_repo = os.environ["STUDENT_MODEL"]
+          max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "220"))
+
+          print("=" * 80)
+          print("QUALITATIVE COMPARISON ACROSS STRATEGIES")
+          print("=" * 80)
+
+          print("[LOAD] base student:", student_repo)
+          base_model, base_tok = load(student_repo)
+
+          def promptify(tok, user_text: str) -> str:
+              msgs = [
+                  {"role": "system", "content": "Answer directly and concisely. For code tasks, code first."},
+                  {"role": "user", "content": user_text},
+              ]
+              return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+          def answer(model, tok, user_text: str) -> str:
+              return generate(
+                  model,
+                  tok,
+                  prompt=promptify(tok, user_text),
+                  max_tokens=max_new_tokens,
+                  verbose=False,
+              ).strip()
+
+          for strategy_dir in sorted(strategy_root.iterdir()):
+              if not strategy_dir.is_dir():
+                  continue
+
+              adapter_dir = strategy_dir / "adapter_dora"
+              test_path = strategy_dir / "test.jsonl"
+              if not test_path.exists():
+                  continue
+
+              print("\n" + "#" * 80)
+              print("STRATEGY:", strategy_dir.name)
+              print("#" * 80)
+
+              samples = []
+              with test_path.open("r", encoding="utf-8") as f:
+                  for line in f:
+                      samples.append(json.loads(line))
+              samples = samples[:4]
+
+              print("[LOAD] adapted student with adapter:", adapter_dir)
+              tuned_model, tuned_tok = load(student_repo, adapter_path=str(adapter_dir))
+
+              for i, ex in enumerate(samples, start=1):
+                  prompt = ex["prompt"]
+                  teacher = ex["completion"]
+                  base = answer(base_model, base_tok, prompt)
+                  tuned = answer(tuned_model, tuned_tok, prompt)
+
+                  print("\n" + "-" * 80)
+                  print(f"SAMPLE {i}")
+                  print("-" * 80)
+                  print("PROMPT:\n", prompt)
+                  print("\nTEACHER TARGET PREVIEW:\n", teacher[:1200])
+                  print("\nBASE STUDENT PREVIEW:\n", base[:1200])
+                  print("\nDORA STUDENT PREVIEW:\n", tuned[:1200])
+          PY
+
+          "${VENV_DIR}/bin/python" scripts/qualitative_compare.py | tee "${SUMMARY_DIR}/qualitative_compare.log"
+
+      - name: Final summary
+        run: |
+          set -euxo pipefail
+          echo "================ ATTEMPT RESULTS TSV ================"
+          cat "${SUMMARY_DIR}/attempt_results.tsv"
+          echo
+          echo "================ FILE TREE ================"
+          find "${DATA_ROOT}" -maxdepth 3 -type f | sort
+          echo "=========================================="
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-benchmark-first-ultra-verbose
+          path: |
+            ${{ env.DATA_ROOT }}
