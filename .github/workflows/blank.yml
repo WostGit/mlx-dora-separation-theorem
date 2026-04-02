@@ -31,7 +31,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Create virtual environment
         run: |
@@ -749,7 +748,22 @@ jobs:
             echo "[4/4] Extract coarse metrics"
             "${PYTHON}" -c "
           import sys
-          # Completed custom extraction logic here...
+          import re
+          
+          def extract_loss(filepath):
+              try:
+                  with open(filepath, 'r') as f:
+                      content = f.read()
+                      matches = re.findall(r'Test loss\s+([\d.]+)', content)
+                      return matches[-1] if matches else 'N/A'
+              except Exception:
+                  return 'Error'
+          
+          baseline = extract_loss('${strategy_dir}/baseline_test.log')
+          adapted = extract_loss('${strategy_dir}/adapted_test.log')
+          
+          with open('${SUMMARY_DIR}/attempt_results.tsv', 'a') as f:
+              f.write(f'${strategy_name}\tTestLoss\t{baseline}\tTestLoss\t{adapted}\tSuccess\n')
           "
           done
           SH
