@@ -1,4 +1,4 @@
-name: dora-benchmark-self-correct
+name: dora-benchmark-scaled-hard
 
 on:
   workflow_dispatch:
@@ -35,11 +35,10 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
-      - name: Create Competent Distillation Script
+      - name: Generate Hard Dataset & Scale Up
         run: |
           mkdir -p scripts
-          # Using a proper delimiter to prevent the shell from eating our Python variables
-          cat << 'EOF' > scripts/self_correct_distill.py
+          cat << 'EOF' > scripts/scaled_distill.py
           import json
           import os
           from pathlib import Path
@@ -54,77 +53,72 @@ jobs:
           print(f"[LOAD] Loading Student: {student_repo}")
           student_model, student_tok = load(student_repo)
 
-          # Prompts targeting edge cases
+          # Expanded, harder multi-step tasks
           tasks = [
-              "Write a safe divide(a,b) function in Python handling zero.",
-              "If 5 workers finish a job in 12 days, how many days for 8 workers?",
-              "Generate a valid JSON object reporting system status 'green' and an array of 2 server IDs."
+              "Write a Python function to find the longest palindromic substring in a string.",
+              "If 5 workers take 12 days to build 2 houses, how many days do 3 workers take to build 5 houses?",
+              "Generate a valid JSON representing a binary tree node with left and right children.",
+              "Explain the difference between a mutex and a semaphore with a quick Python analogy.",
+              "Solve for x: 3x + 5 = 20."
           ]
 
-          def promptify(tok, text, system="You are a precise assistant."):
+          def promptify(tok, text, system="You are a brilliant assistant. Answer directly and precisely."):
               msgs = [{"role": "system", "content": system}, {"role": "user", "content": text}]
               return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
           training_data = []
 
-          print("\n>>> STARTING STRATEGIC ERROR MINING")
+          print("\n>>> PROBING STUDENT ON HARD TASKS")
           for task in tasks:
-              print(f"\nEvaluating Task: {task}")
+              print(f"\nTask: {task}")
               
-              # 1. Ask Teacher for the ground truth
-              print("Teacher constructing ideal solution...")
-              ground_truth = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, task), max_tokens=150).strip()
+              # Get Teacher's golden response
+              ground_truth = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, task), max_tokens=200).strip()
               
-              # 2. Ask Student to attempt it
-              print("Student attempting task...")
-              student_attempt = generate(student_model, student_tok, prompt=promptify(student_tok, task), max_tokens=150).strip()
+              # Get Student's attempt
+              student_attempt = generate(student_model, student_tok, prompt=promptify(student_tok, task), max_tokens=200).strip()
               
-              # 3. Use Teacher as a Rubric Judge
+              # Teacher evaluates student
               judge_prompt = (
                   f"Task: {task}\n\n"
-                  f"Target Correct Solution: {ground_truth}\n\n"
-                  f"Student's Attempt: {student_attempt}\n\n"
-                  f"Does the Student's attempt conceptually match the ground truth? Answer with EXACTLY 'YES' or 'NO' first, then a 1-sentence reason."
+                  f"Target Solution:\n{ground_truth}\n\n"
+                  f"Student Attempt:\n{student_attempt}\n\n"
+                  f"Does the student match the core logic of the target? Reply EXACTLY with 'YES' or 'NO' followed by a short reason."
               )
               
-              print("Teacher judging student performance...")
-              judgment = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, judge_prompt), max_tokens=50).strip()
+              judgment = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, judge_prompt), max_tokens=60).strip()
               print(f"Verdict: {judgment}")
               
-              # If the student fails, we force it into the training pool.
-              # If the student passes, we don't waste compute teaching it what it already knows!
-              if "NO" in judgment.upper() or len(training_data) < 2:
-                  print("-> Action: Student failed or pool too small. Adding target to training queue.")
+              # Force learning on failures or edge cases
+              if "NO" in judgment.upper() or len(training_data) < 3:
                   training_data.append({"prompt": task, "completion": ground_truth})
-              else:
-                  print("-> Action: Student succeeded. Skipping training for this prompt.")
 
-          # Save the extracted weak-spot dataset
+          # Scale the training dataset size by padding it up
           data_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "distill_runs" / "dora_run"
           data_dir.mkdir(parents=True, exist_ok=True)
           
-          # Pad out slightly so test commands don't complain about data size
-          padded_data = training_data * 5
+          padded_data = training_data * 10  # Creating a larger training pool
+          
           for name in ["train.jsonl", "valid.jsonl", "test.jsonl"]:
               with open(data_dir / name, "w") as f:
                   for item in padded_data:
                       f.write(json.dumps(item) + "\n")
                       
-          print(f"\nSetup complete. Generated focused dataset with {len(training_data)} unique correction samples.")
+          print(f"\nConstructed a scaled dataset with {len(padded_data)} total samples.")
           EOF
 
-      - name: Run Self-Correcting Distillation
+      - name: Run Scaled Distillation
         run: |
           set -euxo pipefail
-          "${VENV_DIR}/bin/python" scripts/self_correct_distill.py
+          "${VENV_DIR}/bin/python" scripts/scaled_distill.py
 
-      - name: Fine-tune Student on Extracted Failures
+      - name: Scale Up DoRA Training
         run: |
           set -euxo pipefail
           export PATH="${VENV_DIR}/bin:$PATH"
           
           echo "########################################################################"
-          echo "DORA TRAINING ON STUDENT WEAK SPOTS"
+          echo "DORA TRAINING - SCALED ITERATIONS & HARD PROMPTS"
           echo "########################################################################"
           
           mlx_lm.lora \
@@ -133,7 +127,7 @@ jobs:
             --data "${GITHUB_WORKSPACE}/distill_runs/dora_run" \
             --adapter-path "${GITHUB_WORKSPACE}/distill_runs/dora_run/adapters" \
             --fine-tune-type dora \
-            --iters 30 \
+            --iters 100 \
             --batch-size 1 \
             --num-layers 4 \
             --learning-rate 1e-5 \
