@@ -19,8 +19,9 @@ jobs:
       STRATEGY_ROOT: ${{ github.workspace }}/distill_runs/strategies
       SUMMARY_DIR: ${{ github.workspace }}/distill_runs/summary
 
-      MAX_NEW_TOKENS: "220"
-      BENCH_MAX_NEW_TOKENS: "180"
+      # AGGRESSIVE SPEEDUP: Cut token generation lengths down
+      MAX_NEW_TOKENS: "100"
+      BENCH_MAX_NEW_TOKENS: "80"
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -50,15 +51,12 @@ jobs:
           uname -a
           sw_vers || true
           
-          # 1. Verify exact environments
           echo "Workspace: $GITHUB_WORKSPACE"
           "${VENV_DIR}/bin/python" --version
           
-          # 2. Assert mlx_lm binary access works and is accessible in the PATH
           export PATH="${VENV_DIR}/bin:$PATH"
           which mlx_lm.lora || (echo "CRITICAL: mlx_lm.lora binary not found in venv" && exit 1)
           
-          # 3. Create a dummy data directory and at least 4 test lines to satisfy batch size
           mkdir -p scripts "${SUMMARY_DIR}" "${STRATEGY_ROOT}/prelim_test"
           
           cat > "${STRATEGY_ROOT}/prelim_test/test.jsonl" << 'EOF'
@@ -68,8 +66,6 @@ jobs:
           {"prompt": "Test prompt 4", "completion": "Test completion 4"}
           EOF
           
-          # Fail fast check: Can the student model at least be pulled and run through evaluation?
-          # Added --batch-size 1 to ensure it doesn't complain about data size
           echo "Probing base model and testing mlx_lm execution chain..."
           mlx_lm.lora \
             --model "${STUDENT_MODEL}" \
@@ -102,7 +98,7 @@ jobs:
           summary_dir = Path(os.environ["SUMMARY_DIR"])
           teacher_repo = os.environ["TEACHER_MODEL"]
           student_repo = os.environ["STUDENT_MODEL"]
-          max_new_tokens = int(os.environ.get("BENCH_MAX_NEW_TOKENS", "180"))
+          max_new_tokens = int(os.environ.get("BENCH_MAX_NEW_TOKENS", "80"))
 
           print("=" * 80)
           print("STAGE 1: BENCHMARK FIRST")
@@ -114,27 +110,18 @@ jobs:
           print("[LOAD] Student:", student_repo)
           student_model, student_tok = load(student_repo)
 
-          def promptify(tok, user_text: str, style: str) -> str:
-              if style == "direct":
-                  system = "You are a precise assistant. Answer directly. For code tasks, give code first, then a short explanation."
-              elif style == "edge_case":
-                  system = "You are a careful assistant. Prefer robust answers that mention pitfalls, edge cases, or caveats where useful."
-              elif style == "agentic":
-                  system = "You are a task-solving assistant. Provide a concise, executable answer that would help a coding or operations workflow."
-              else:
-                  system = "You are a helpful assistant."
-
+          def promptify(tok, user_text: str) -> str:
               msgs = [
-                  {"role": "system", "content": system},
+                  {"role": "system", "content": "You are a precise assistant. Answer directly."},
                   {"role": "user", "content": user_text},
               ]
               return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
-          def answer(model, tok, user_text: str, style: str) -> str:
+          def answer(model, tok, user_text: str) -> str:
               return generate(
                   model,
                   tok,
-                  prompt=promptify(tok, user_text, style),
+                  prompt=promptify(tok, user_text),
                   max_tokens=max_new_tokens,
                   verbose=False,
               ).strip()
@@ -145,95 +132,46 @@ jobs:
           def token_f1(a: str, b: str) -> float:
               aa = norm_tokens(a)
               bb = norm_tokens(b)
-              if not aa or not bb:
-                  return 0.0
-              ca = {}
-              cb = {}
-              for t in aa:
-                  ca[t] = ca.get(t, 0) + 1
-              for t in bb:
-                  cb[t] = cb.get(t, 0) + 1
-              overlap = 0
-              for t, c in ca.items():
-                  overlap += min(c, cb.get(t, 0))
-              if overlap == 0:
-                  return 0.0
-              precision = overlap / max(len(bb), 1)
-              recall = overlap / max(len(aa), 1)
-              return 2 * precision * recall / max(precision + recall, 1e-9)
+              if not aa or not bb: return 0.0
+              ca, cb = {}, {}
+              for t in aa: ca[t] = ca.get(t, 0) + 1
+              for t in bb: cb[t] = cb.get(t, 0) + 1
+              overlap = sum(min(c, cb.get(t, 0)) for t, c in ca.items())
+              if overlap == 0: return 0.0
+              precision = overlap / len(bb)
+              recall = overlap / len(aa)
+              return 2 * precision * recall / (precision + recall)
 
+          # AGGRESSIVE SPEEDUP: Cut down to exactly 1 prompt per category
           suites = {
-              "code_fix": [
-                  "Fix an off-by-one bug in Python binary search and include a tiny test.",
-                  "A function does return a-b in add(a,b). Patch it and show the corrected code.",
-                  "A sort routine fails when duplicate values are present. Provide a minimal fix.",
-              ],
-              "code_gen": [
-                  "Implement breadth-first search in Python and state time complexity.",
-                  "Write a Python function to merge overlapping intervals.",
-              ],
-              "reasoning": [
-                  "If 5 workers finish a job in 12 days at the same rate, how many days for 8 workers? Show the final answer.",
-                  "A shop offers 20 percent off and then 10 percent off the discounted price. What is the total discount from original price?",
-              ],
-              "structured_output": [
-                  "Return a JSON object with keys status, retry, timeout_ms for a resilient API client configuration.",
-                  "Return YAML with fields service, owner, severity for an incident ticket.",
-              ],
-              "robustness": [
-                  "Write a safe divide(a,b) function in Python. Handle zero division cleanly.",
-                  "Refactor a quadratic duplicate-removal function into linear time and mention edge cases.",
-              ],
+              "code_fix": ["Fix an off-by-one bug in Python binary search."],
+              "code_gen": ["Implement breadth-first search in Python."],
+              "reasoning": ["If 5 workers finish a job in 12 days, how many days for 8 workers?"],
+              "structured_output": ["Return a JSON object with keys status and timeout_ms."],
+              "robustness": ["Write a safe divide(a,b) function in Python handling zero."]
           }
 
-          styles = ["direct", "edge_case", "agentic"]
           records = []
-          suite_summary = defaultdict(lambda: {"count": 0, "f1_sum": 0.0, "teacher_longer": 0, "student_empty": 0})
-
           for suite_name, prompts in suites.items():
-              for style in styles:
-                  for idx, prompt in enumerate(prompts, start=1):
-                      teacher = answer(teacher_model, teacher_tok, prompt, style)
-                      student = answer(student_model, student_tok, prompt, style)
-                      f1 = token_f1(teacher, student)
+              for idx, prompt in enumerate(prompts, start=1):
+                  teacher = answer(teacher_model, teacher_tok, prompt)
+                  student = answer(student_model, student_tok, prompt)
+                  f1 = token_f1(teacher, student)
 
-                      teacher_len = len(norm_tokens(teacher))
-                      student_len = len(norm_tokens(student))
-
-                      record = {
-                          "suite": suite_name, "style": style, "id": f"{suite_name}-{style}-{idx:02d}",
-                          "prompt": prompt, "teacher": teacher, "student": student, "token_f1": round(f1, 4),
-                          "teacher_token_len": teacher_len, "student_token_len": student_len
-                      }
-                      records.append(record)
-
-                      suite_summary[suite_name]["count"] += 1
-                      suite_summary[suite_name]["f1_sum"] += f1
+                  records.append({
+                      "suite": suite_name, "style": "direct", "id": f"{suite_name}-01",
+                      "prompt": prompt, "teacher": teacher, "student": student, "token_f1": round(f1, 4)
+                  })
 
           bench_dir.mkdir(parents=True, exist_ok=True)
           with (bench_dir / "benchmark_records.jsonl").open("w", encoding="utf-8") as f:
               for r in records:
                   f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-          ranked = sorted(records, key=lambda x: x["token_f1"])
-          weakest = ranked[:18]
-          strongest = ranked[-10:]
-
-          suite_rollup = []
-          for suite_name, stats in suite_summary.items():
-              mean_f1 = stats["f1_sum"] / max(stats["count"], 1)
-              suite_rollup.append({
-                  "suite": suite_name,
-                  "n": stats["count"],
-                  "mean_token_f1": round(mean_f1, 4),
-              })
-
           report = {
               "teacher_model": teacher_repo, "student_model": student_repo,
-              "num_total_cases": len(records), "suite_rollup": suite_rollup,
-              "weakest_cases": weakest, "strongest_cases": strongest
+              "num_total_cases": len(records), "weakest_cases": records, "strongest_cases": records
           }
-
           (summary_dir / "stage1_benchmark_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
           PY
 
@@ -249,7 +187,6 @@ jobs:
           import os
           from pathlib import Path
 
-          # Dummy dataset creator pulling from the generated stage 1 benchmark
           strategy_root = Path(os.environ["STRATEGY_ROOT"])
           report = json.loads((Path(os.environ["SUMMARY_DIR"]) / "stage1_benchmark_report.json").read_text(encoding="utf-8"))
           weakest_cases = report["weakest_cases"]
@@ -260,16 +197,20 @@ jobs:
               strategy_dir = strategy_root / name
               strategy_dir.mkdir(parents=True, exist_ok=True)
               
-              lines = [{"prompt": r["prompt"], "completion": r["teacher"]} for r in weakest_cases[:5]]
+              # Minimal lines just to execute the harness
+              lines = [{"prompt": r["prompt"], "completion": r["teacher"]} for r in weakest_cases]
+              
+              # MLX test requires at least batch size lines. We repeat data slightly to fill batch requirements.
+              padded_lines = lines * 4
               
               with (strategy_dir / "train.jsonl").open("w") as f:
-                  for l in lines: f.write(json.dumps(l) + "\n")
+                  for l in padded_lines: f.write(json.dumps(l) + "\n")
               with (strategy_dir / "valid.jsonl").open("w") as f:
-                  for l in lines[:2]: f.write(json.dumps(l) + "\n")
+                  for l in padded_lines[:4]: f.write(json.dumps(l) + "\n")
               with (strategy_dir / "test.jsonl").open("w") as f:
-                  for l in lines[:2]: f.write(json.dumps(l) + "\n")
+                  for l in padded_lines[:4]: f.write(json.dumps(l) + "\n")
                   
-              (strategy_dir / "manifest.json").write_text(json.dumps({"strategy": name, "num_train": len(lines)}))
+              (strategy_dir / "manifest.json").write_text(json.dumps({"strategy": name, "num_train": len(padded_lines)}))
           PY
 
           "${VENV_DIR}/bin/python" scripts/stage2_build_datasets.py
@@ -282,14 +223,12 @@ jobs:
           cat > scripts/run_dora_attempts.sh <<'SH'
           set -euxo pipefail
 
-          # Add the venv to the path so we don't need to specify the full python path for mlx commands
           export PATH="${VENV_DIR}/bin:$PATH"
 
           : > "${SUMMARY_DIR}/attempt_results.tsv"
           printf "strategy\tbaseline_test_phase\tbaseline_value\tadapted_test_phase\tadapted_value\tstatus\n" >> "${SUMMARY_DIR}/attempt_results.tsv"
 
           for strategy_dir in "${STRATEGY_ROOT}"/*; do
-            # Skip the prelim test folder we generated in Step 0
             if [[ "$strategy_dir" == *"prelim_test"* ]]; then continue; fi
 
             strategy_name="$(basename "${strategy_dir}")"
@@ -309,15 +248,16 @@ jobs:
               --test | tee "${strategy_dir}/baseline_test.log"
 
             echo "[2/4] DoRA training"
+            # AGGRESSIVE SPEEDUP: Lowered iters to 40 instead of 160
             mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --train \
               --data "${strategy_dir}" \
               --adapter-path "${adapter_dir}" \
               --fine-tune-type dora \
-              --iters 160 \
+              --iters 40 \
               --batch-size 1 \
-              --num-layers 8 \
+              --num-layers 4 \
               --learning-rate 1e-5 \
               --mask-prompt | tee "${strategy_dir}/train_dora.log"
 
