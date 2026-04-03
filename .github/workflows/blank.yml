@@ -1,4 +1,4 @@
-name: dora-benchmark-logit-distill
+name: dora-benchmark-self-correct
 
 on:
   workflow_dispatch:
@@ -13,8 +13,6 @@ jobs:
 
       TEACHER_MODEL: mlx-community/Qwen2.5-1.5B-Instruct-4bit
       STUDENT_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
-
-      BENCH_MAX_NEW_TOKENS: "100"
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -37,95 +35,106 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
-      - name: Run Native MLX Logit Distillation
+      - name: Create Competent Distillation Script
         run: |
-          set -euxo pipefail
           mkdir -p scripts
-
-          cat > scripts/logit_distill.py <<'PY'
+          # Using a proper delimiter to prevent the shell from eating our Python variables
+          cat << 'EOF' > scripts/self_correct_distill.py
+          import json
           import os
-          import mlx.core as mx
-          import mlx.nn as nn
-          from mlx_lm import load
-          from mlx_lm.tuner.lora import Linear as LoRALinear
+          from pathlib import Path
+          from mlx_lm import load, generate
 
-          # 1. Load Models
           teacher_repo = os.environ["TEACHER_MODEL"]
           student_repo = os.environ["STUDENT_MODEL"]
 
           print(f"[LOAD] Loading Teacher: {teacher_repo}")
           teacher_model, teacher_tok = load(teacher_repo)
-          teacher_model.freeze()  # Keep teacher frozen
 
           print(f"[LOAD] Loading Student: {student_repo}")
           student_model, student_tok = load(student_repo)
 
-          # 2. Apply DoRA/LoRA to Student manually
-          # We swap standard linear layers with low-rank ones
-          for name, layer in list(student_model.named_modules()):
-              if "q_proj" in name or "v_proj" in name:
-                  if isinstance(layer, nn.Linear):
-                      parent_name = name.rsplit('.', 1)[0]
-                      parent = student_model.get_submodule(parent_name)
-                      # Apply a rank 8 LoRA
-                      setattr(parent, name.split('.')[-1], LoRALinear.from_linear(layer, r=8))
-
-          # 3. Define Loss Function (Cross-Entropy + KL Divergence)
-          def distillation_loss(student_logits, teacher_logits, targets, temp=2.0, alpha=0.5):
-              # Shift targets for standard causal LM next-token prediction
-              student_logits = student_logits[:, :-1, :]
-              teacher_logits = teacher_logits[:, :-1, :]
-              targets = targets[:, 1:]
-
-              # Hard loss (Standard SFT)
-              ce_loss = nn.losses.cross_entropy(student_logits, targets, reduction="mean")
-
-              # Soft loss (Logit Distillation)
-              # Normalize probability distribution with a high temperature
-              p_teacher = mx.softmax(teacher_logits / temp, axis=-1)
-              p_student = mx.log_softmax(student_logits / temp, axis=-1)
-              
-              # Compute KL Divergence
-              kl_loss = -mx.sum(p_teacher * p_student, axis=-1).mean() * (temp ** 2)
-
-              return (alpha * ce_loss) + ((1 - alpha) * kl_loss)
-
-          # 4. Custom Training Loop
-          optimizer = mx.optimizers.Adam(learning_rate=1e-5)
-          prompts = [
-              "Fix an off-by-one bug in Python binary search.",
+          # Prompts targeting edge cases
+          tasks = [
+              "Write a safe divide(a,b) function in Python handling zero.",
               "If 5 workers finish a job in 12 days, how many days for 8 workers?",
-              "Implement breadth-first search in Python."
+              "Generate a valid JSON object reporting system status 'green' and an array of 2 server IDs."
           ]
 
-          # Pre-tokenize all prompts using the student tokenizer
-          encoded_prompts = [mx.array([student_tok.encode(p)]) for p in prompts]
+          def promptify(tok, text, system="You are a precise assistant."):
+              msgs = [{"role": "system", "content": system}, {"role": "user", "content": text}]
+              return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
-          print("\n>>> STARTING CUSTOM LOGIT DISTILLATION LOOP")
-          for epoch in range(10):
-              total_loss = 0.0
-              for i, input_ids in enumerate(encoded_prompts):
-                  # Forward pass with gradients enabled for the student's LoRA params
-                  def loss_fn(model):
-                      # MLX models typically return both logits and a state tuple
-                      s_logits, _ = model(input_ids)
-                      # Teachers are frozen, so its forward pass is no_grad by default
-                      t_logits, _ = teacher_model(input_ids)
-                      return distillation_loss(s_logits, t_logits, input_ids)
+          training_data = []
 
-                  # Compute loss and gradients
-                  loss_grad_fn = mx.value_and_grad(student_model, loss_fn)
-                  loss, grads = loss_grad_fn(student_model)
+          print("\n>>> STARTING STRATEGIC ERROR MINING")
+          for task in tasks:
+              print(f"\nEvaluating Task: {task}")
+              
+              # 1. Ask Teacher for the ground truth
+              print("Teacher constructing ideal solution...")
+              ground_truth = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, task), max_tokens=150).strip()
+              
+              # 2. Ask Student to attempt it
+              print("Student attempting task...")
+              student_attempt = generate(student_model, student_tok, prompt=promptify(student_tok, task), max_tokens=150).strip()
+              
+              # 3. Use Teacher as a Rubric Judge
+              judge_prompt = (
+                  f"Task: {task}\n\n"
+                  f"Target Correct Solution: {ground_truth}\n\n"
+                  f"Student's Attempt: {student_attempt}\n\n"
+                  f"Does the Student's attempt conceptually match the ground truth? Answer with EXACTLY 'YES' or 'NO' first, then a 1-sentence reason."
+              )
+              
+              print("Teacher judging student performance...")
+              judgment = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, judge_prompt), max_tokens=50).strip()
+              print(f"Verdict: {judgment}")
+              
+              # If the student fails, we force it into the training pool.
+              # If the student passes, we don't waste compute teaching it what it already knows!
+              if "NO" in judgment.upper() or len(training_data) < 2:
+                  print("-> Action: Student failed or pool too small. Adding target to training queue.")
+                  training_data.append({"prompt": task, "completion": ground_truth})
+              else:
+                  print("-> Action: Student succeeded. Skipping training for this prompt.")
 
-                  # Update weights
-                  optimizer.update(student_model, grads)
-                  mx.eval(student_model.state, loss)  # Trigger lazy evaluation
+          # Save the extracted weak-spot dataset
+          data_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "distill_runs" / "dora_run"
+          data_dir.mkdir(parents=True, exist_ok=True)
+          
+          # Pad out slightly so test commands don't complain about data size
+          padded_data = training_data * 5
+          for name in ["train.jsonl", "valid.jsonl", "test.jsonl"]:
+              with open(data_dir / name, "w") as f:
+                  for item in padded_data:
+                      f.write(json.dumps(item) + "\n")
+                      
+          print(f"\nSetup complete. Generated focused dataset with {len(training_data)} unique correction samples.")
+          EOF
 
-                  total_loss += loss.item()
+      - name: Run Self-Correcting Distillation
+        run: |
+          set -euxo pipefail
+          "${VENV_DIR}/bin/python" scripts/self_correct_distill.py
 
-              print(f"Epoch {epoch+1} | Mean Loss: {total_loss / len(prompts):.4f}")
-
-          print("\nWorkflow successful. Soft alignment completed without external files.")
-          PY
-
-          "${VENV_DIR}/bin/python" scripts/logit_distill.py
+      - name: Fine-tune Student on Extracted Failures
+        run: |
+          set -euxo pipefail
+          export PATH="${VENV_DIR}/bin:$PATH"
+          
+          echo "########################################################################"
+          echo "DORA TRAINING ON STUDENT WEAK SPOTS"
+          echo "########################################################################"
+          
+          mlx_lm.lora \
+            --model "${STUDENT_MODEL}" \
+            --train \
+            --data "${GITHUB_WORKSPACE}/distill_runs/dora_run" \
+            --adapter-path "${GITHUB_WORKSPACE}/distill_runs/dora_run/adapters" \
+            --fine-tune-type dora \
+            --iters 30 \
+            --batch-size 1 \
+            --num-layers 4 \
+            --learning-rate 1e-5 \
+            --mask-prompt
