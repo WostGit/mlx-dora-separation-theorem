@@ -17,9 +17,7 @@ jobs:
       DATA_ROOT: ${{ github.workspace }}/distill_runs
       BENCH_DIR: ${{ github.workspace }}/distill_runs/bench
       STRATEGY_ROOT: ${{ github.workspace }}/distill_runs/strategies
-      SUMMARY_DIR: ${{ github.workspace }}/distill_runs/summary
 
-      # AGGRESSIVE SPEEDUP: Cut token generation lengths down
       MAX_NEW_TOKENS: "100"
       BENCH_MAX_NEW_TOKENS: "80"
       VENV_DIR: ${{ github.workspace }}/.venv
@@ -44,40 +42,7 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
-      - name: Step 0 - Preliminaries and Fail-Fast Environment Check
-        run: |
-          set -euxo pipefail
-          echo "================ PRELIMINARY CHECKS ================"
-          uname -a
-          sw_vers || true
-          
-          echo "Workspace: $GITHUB_WORKSPACE"
-          "${VENV_DIR}/bin/python" --version
-          
-          export PATH="${VENV_DIR}/bin:$PATH"
-          which mlx_lm.lora || (echo "CRITICAL: mlx_lm.lora binary not found in venv" && exit 1)
-          
-          mkdir -p scripts "${SUMMARY_DIR}" "${STRATEGY_ROOT}/prelim_test"
-          
-          cat > "${STRATEGY_ROOT}/prelim_test/test.jsonl" << 'EOF'
-          {"prompt": "Test prompt 1", "completion": "Test completion 1"}
-          {"prompt": "Test prompt 2", "completion": "Test completion 2"}
-          {"prompt": "Test prompt 3", "completion": "Test completion 3"}
-          {"prompt": "Test prompt 4", "completion": "Test completion 4"}
-          EOF
-          
-          echo "Probing base model and testing mlx_lm execution chain..."
-          mlx_lm.lora \
-            --model "${STUDENT_MODEL}" \
-            --data "${STRATEGY_ROOT}/prelim_test" \
-            --adapter-path "" \
-            --batch-size 1 \
-            --test || (echo "CRITICAL: Base model load or execution failed." && exit 1)
-          
-          echo "Step 0 checks passed. Safe to continue to expensive synthetic data generation."
-          echo "===================================================="
-
-      - name: Stage 1 - Build benchmark suite and run ultra verbose teacher-student gap analysis
+      - name: Stage 1 - Run Verbose Teacher-Student Gap Analysis
         run: |
           set -euxo pipefail
           mkdir -p scripts "${BENCH_DIR}"
@@ -85,24 +50,13 @@ jobs:
           cat > scripts/stage1_benchmark.py <<'PY'
           import json
           import os
-          import random
           import re
           from pathlib import Path
-          from collections import defaultdict
-
           from mlx_lm import load, generate
 
-          random.seed(0)
-
-          bench_dir = Path(os.environ["BENCH_DIR"])
-          summary_dir = Path(os.environ["SUMMARY_DIR"])
           teacher_repo = os.environ["TEACHER_MODEL"]
           student_repo = os.environ["STUDENT_MODEL"]
           max_new_tokens = int(os.environ.get("BENCH_MAX_NEW_TOKENS", "80"))
-
-          print("=" * 80)
-          print("STAGE 1: BENCHMARK FIRST")
-          print("=" * 80)
 
           print("\n[LOAD] Teacher:", teacher_repo)
           teacher_model, teacher_tok = load(teacher_repo)
@@ -111,38 +65,10 @@ jobs:
           student_model, student_tok = load(student_repo)
 
           def promptify(tok, user_text: str) -> str:
-              msgs = [
-                  {"role": "system", "content": "You are a precise assistant. Answer directly."},
-                  {"role": "user", "content": user_text},
-              ]
+              msgs = [{"role": "system", "content": "You are a precise assistant. Answer directly."},
+                      {"role": "user", "content": user_text}]
               return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
-          def answer(model, tok, user_text: str) -> str:
-              return generate(
-                  model,
-                  tok,
-                  prompt=promptify(tok, user_text),
-                  max_tokens=max_new_tokens,
-                  verbose=False,
-              ).strip()
-
-          def norm_tokens(s: str):
-              return re.findall(r"[a-zA-Z0-9_]+", s.lower())
-
-          def token_f1(a: str, b: str) -> float:
-              aa = norm_tokens(a)
-              bb = norm_tokens(b)
-              if not aa or not bb: return 0.0
-              ca, cb = {}, {}
-              for t in aa: ca[t] = ca.get(t, 0) + 1
-              for t in bb: cb[t] = cb.get(t, 0) + 1
-              overlap = sum(min(c, cb.get(t, 0)) for t, c in ca.items())
-              if overlap == 0: return 0.0
-              precision = overlap / len(bb)
-              recall = overlap / len(aa)
-              return 2 * precision * recall / (precision + recall)
-
-          # AGGRESSIVE SPEEDUP: Cut down to exactly 1 prompt per category
           suites = {
               "code_fix": ["Fix an off-by-one bug in Python binary search."],
               "code_gen": ["Implement breadth-first search in Python."],
@@ -153,140 +79,85 @@ jobs:
 
           records = []
           for suite_name, prompts in suites.items():
-              for idx, prompt in enumerate(prompts, start=1):
-                  teacher = answer(teacher_model, teacher_tok, prompt)
-                  student = answer(student_model, student_tok, prompt)
-                  f1 = token_f1(teacher, student)
+              for prompt in prompts:
+                  print(f"\nPrompting: {prompt}")
+                  
+                  # Set verbose=True to force printing tokens straight to terminal
+                  print("\n>>> TEACHER GENERATION:")
+                  teacher_ans = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, prompt), 
+                                         max_tokens=max_new_tokens, verbose=True).strip()
+                  
+                  print("\n>>> STUDENT GENERATION:")
+                  student_ans = generate(student_model, student_tok, prompt=promptify(student_tok, prompt), 
+                                         max_tokens=max_new_tokens, verbose=True).strip()
 
-                  records.append({
-                      "suite": suite_name, "style": "direct", "id": f"{suite_name}-01",
-                      "prompt": prompt, "teacher": teacher, "student": student, "token_f1": round(f1, 4)
-                  })
+                  records.append({"prompt": prompt, "teacher": teacher_ans})
 
+          # Save lines directly for Stage 2
+          bench_dir = Path(os.environ["BENCH_DIR"])
           bench_dir.mkdir(parents=True, exist_ok=True)
-          with (bench_dir / "benchmark_records.jsonl").open("w", encoding="utf-8") as f:
+          with (bench_dir / "minimal_train.jsonl").open("w") as f:
               for r in records:
-                  f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-          report = {
-              "teacher_model": teacher_repo, "student_model": student_repo,
-              "num_total_cases": len(records), "weakest_cases": records, "strongest_cases": records
-          }
-          (summary_dir / "stage1_benchmark_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+                  f.write(json.dumps(r) + "\n")
           PY
 
           "${VENV_DIR}/bin/python" scripts/stage1_benchmark.py
 
-      - name: Stage 2 - Build three ultra verbose DoRA distillation attempts
+      - name: Stage 2 - Run Real-Time DoRA Training & Evaluation
         run: |
           set -euxo pipefail
-          mkdir -p scripts "${STRATEGY_ROOT}"
-
-          cat > scripts/stage2_build_datasets.py <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          strategy_root = Path(os.environ["STRATEGY_ROOT"])
-          report = json.loads((Path(os.environ["SUMMARY_DIR"]) / "stage1_benchmark_report.json").read_text(encoding="utf-8"))
-          weakest_cases = report["weakest_cases"]
-
-          strategies = ["attempt_a_direct_imitation", "attempt_b_bursty_prompt_families", "attempt_c_adaptive_weak_skill_mining"]
-
-          for name in strategies:
-              strategy_dir = strategy_root / name
-              strategy_dir.mkdir(parents=True, exist_ok=True)
-              
-              # Minimal lines just to execute the harness
-              lines = [{"prompt": r["prompt"], "completion": r["teacher"]} for r in weakest_cases]
-              
-              # MLX test requires at least batch size lines. We repeat data slightly to fill batch requirements.
-              padded_lines = lines * 4
-              
-              with (strategy_dir / "train.jsonl").open("w") as f:
-                  for l in padded_lines: f.write(json.dumps(l) + "\n")
-              with (strategy_dir / "valid.jsonl").open("w") as f:
-                  for l in padded_lines[:4]: f.write(json.dumps(l) + "\n")
-              with (strategy_dir / "test.jsonl").open("w") as f:
-                  for l in padded_lines[:4]: f.write(json.dumps(l) + "\n")
-                  
-              (strategy_dir / "manifest.json").write_text(json.dumps({"strategy": name, "num_train": len(padded_lines)}))
-          PY
-
-          "${VENV_DIR}/bin/python" scripts/stage2_build_datasets.py
-
-      - name: Stage 2 - Run DoRA distillation attempts and collect results
-        run: |
-          set -euxo pipefail
-          mkdir -p scripts
-
-          cat > scripts/run_dora_attempts.sh <<'SH'
-          set -euxo pipefail
-
           export PATH="${VENV_DIR}/bin:$PATH"
 
-          : > "${SUMMARY_DIR}/attempt_results.tsv"
-          printf "strategy\tbaseline_test_phase\tbaseline_value\tadapted_test_phase\tadapted_value\tstatus\n" >> "${SUMMARY_DIR}/attempt_results.tsv"
-
-          for strategy_dir in "${STRATEGY_ROOT}"/*; do
-            if [[ "$strategy_dir" == *"prelim_test"* ]]; then continue; fi
-
-            strategy_name="$(basename "${strategy_dir}")"
-            adapter_dir="${strategy_dir}/adapter_dora"
-            mkdir -p "${adapter_dir}"
-
-            echo "########################################################################"
-            echo "RUNNING STRATEGY: ${strategy_name}"
-            echo "########################################################################"
-
-            echo "[1/4] Baseline test before DoRA"
-            mlx_lm.lora \
-              --model "${STUDENT_MODEL}" \
-              --data "${strategy_dir}" \
-              --adapter-path "" \
-              --batch-size 1 \
-              --test | tee "${strategy_dir}/baseline_test.log"
-
-            echo "[2/4] DoRA training"
-            # AGGRESSIVE SPEEDUP: Lowered iters to 40 instead of 160
-            mlx_lm.lora \
-              --model "${STUDENT_MODEL}" \
-              --train \
-              --data "${strategy_dir}" \
-              --adapter-path "${adapter_dir}" \
-              --fine-tune-type dora \
-              --iters 40 \
-              --batch-size 1 \
-              --num-layers 4 \
-              --learning-rate 1e-5 \
-              --mask-prompt | tee "${strategy_dir}/train_dora.log"
-
-            echo "[3/4] Adapted test after DoRA"
-            mlx_lm.lora \
-              --model "${STUDENT_MODEL}" \
-              --adapter-path "${adapter_dir}" \
-              --data "${strategy_dir}" \
-              --batch-size 1 \
-              --test | tee "${strategy_dir}/adapted_test.log"
-
-            echo "[4/4] Extract coarse metrics"
-            python -c "
-          import re
-          def extract_loss(filepath):
-              try:
-                  with open(filepath, 'r') as f:
-                      content = f.read()
-                      matches = re.findall(r'Test loss\s+([\d.]+)', content)
-                      return matches[-1] if matches else 'N/A'
-              except Exception: return 'Error'
+          # 1. Prepare raw data directly into the folder
+          mkdir -p "${STRATEGY_ROOT}/dora_run"
           
-          baseline = extract_loss('${strategy_dir}/baseline_test.log')
-          adapted = extract_loss('${strategy_dir}/adapted_test.log')
-          
-          with open('${SUMMARY_DIR}/attempt_results.tsv', 'a') as f:
-              f.write(f'${strategy_name}\tTestLoss\t{baseline}\tTestLoss\t{adapted}\tSuccess\n')
+          # Multiply data so test doesn't crash on batch limits
+          python -c "
+          import json, os
+          with open('$BENCH_DIR/minimal_train.jsonl') as f:
+              lines = [line.strip() for line in f if line.strip()]
+          padded = lines * 4
+          for filename in ['train.jsonl', 'valid.jsonl', 'test.jsonl']:
+              with open(f'$STRATEGY_ROOT/dora_run/{filename}', 'w') as out:
+                  out.write('\n'.join(padded) + '\n')
           "
-          done
-          SH
-          chmod +x scripts/run_dora_attempts.sh
-          ./scripts/run_dora_attempts.sh
+
+          # 2. Baseline test
+          echo "########################################################################"
+          echo "STAGE 2: BASELINE EVALUATION"
+          echo "########################################################################"
+          mlx_lm.lora \
+            --model "${STUDENT_MODEL}" \
+            --data "${STRATEGY_ROOT}/dora_run" \
+            --adapter-path "" \
+            --batch-size 1 \
+            --test
+
+          # 3. Training
+          echo "########################################################################"
+          echo "STAGE 2: DORA ADAPTATION TRAINING"
+          echo "########################################################################"
+          mlx_lm.lora \
+            --model "${STUDENT_MODEL}" \
+            --train \
+            --data "${STRATEGY_ROOT}/dora_run" \
+            --adapter-path "${STRATEGY_ROOT}/dora_run/adapters" \
+            --fine-tune-type dora \
+            --iters 40 \
+            --batch-size 1 \
+            --num-layers 4 \
+            --learning-rate 1e-5 \
+            --mask-prompt
+
+          # 4. Final test
+          echo "########################################################################"
+          echo "STAGE 2: FINAL ADAPTED EVALUATION"
+          echo "########################################################################"
+          mlx_lm.lora \
+            --model "${STUDENT_MODEL}" \
+            --adapter-path "${STRATEGY_ROOT}/dora_run/adapters" \
+            --data "${STRATEGY_ROOT}/dora_run" \
+            --batch-size 1 \
+            --test
+
+          echo "Workflow finished. Check console above for all evaluation results."
