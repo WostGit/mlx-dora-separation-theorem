@@ -50,7 +50,6 @@ jobs:
           cat > scripts/stage1_benchmark.py <<'PY'
           import json
           import os
-          import re
           from pathlib import Path
           from mlx_lm import load, generate
 
@@ -82,7 +81,6 @@ jobs:
               for prompt in prompts:
                   print(f"\nPrompting: {prompt}")
                   
-                  # Set verbose=True to force printing tokens straight to terminal
                   print("\n>>> TEACHER GENERATION:")
                   teacher_ans = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, prompt), 
                                          max_tokens=max_new_tokens, verbose=True).strip()
@@ -91,9 +89,9 @@ jobs:
                   student_ans = generate(student_model, student_tok, prompt=promptify(student_tok, prompt), 
                                          max_tokens=max_new_tokens, verbose=True).strip()
 
-                  records.append({"prompt": prompt, "teacher": teacher_ans})
+                  # FIX: Changed key "teacher" to "completion" to adhere to MLX completions format
+                  records.append({"prompt": prompt, "completion": teacher_ans})
 
-          # Save lines directly for Stage 2
           bench_dir = Path(os.environ["BENCH_DIR"])
           bench_dir.mkdir(parents=True, exist_ok=True)
           with (bench_dir / "minimal_train.jsonl").open("w") as f:
