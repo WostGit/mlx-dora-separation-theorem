@@ -1,4 +1,4 @@
-name: dora-benchmark-first-ultra-verbose
+name: dora-benchmark-cot-verbose
 
 on:
   workflow_dispatch:
@@ -18,8 +18,8 @@ jobs:
       BENCH_DIR: ${{ github.workspace }}/distill_runs/bench
       STRATEGY_ROOT: ${{ github.workspace }}/distill_runs/strategies
 
-      MAX_NEW_TOKENS: "100"
-      BENCH_MAX_NEW_TOKENS: "80"
+      # Increased token allowance to let the teacher dump its full CoT
+      BENCH_MAX_NEW_TOKENS: "250" 
       VENV_DIR: ${{ github.workspace }}/.venv
 
     steps:
@@ -42,7 +42,7 @@ jobs:
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
-      - name: Stage 1 - Run Verbose Teacher-Student Gap Analysis
+      - name: Stage 1 - Generate Teacher Chain-of-Thought Data
         run: |
           set -euxo pipefail
           mkdir -p scripts "${BENCH_DIR}"
@@ -55,7 +55,7 @@ jobs:
 
           teacher_repo = os.environ["TEACHER_MODEL"]
           student_repo = os.environ["STUDENT_MODEL"]
-          max_new_tokens = int(os.environ.get("BENCH_MAX_NEW_TOKENS", "80"))
+          max_new_tokens = int(os.environ.get("BENCH_MAX_NEW_TOKENS", "250"))
 
           print("\n[LOAD] Teacher:", teacher_repo)
           teacher_model, teacher_tok = load(teacher_repo)
@@ -63,17 +63,18 @@ jobs:
           print("[LOAD] Student:", student_repo)
           student_model, student_tok = load(student_repo)
 
-          def promptify(tok, user_text: str) -> str:
-              msgs = [{"role": "system", "content": "You are a precise assistant. Answer directly."},
+          def promptify(tok, user_text: str, enforce_cot: bool = False) -> str:
+              system_prompt = "You are a precise assistant. Answer directly."
+              if enforce_cot:
+                  system_prompt = "You are a brilliant reasoning assistant. You MUST first provide your detailed step-by-step thinking process wrapped inside <thought> tags, and then state your final answer."
+              
+              msgs = [{"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_text}]
               return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
           suites = {
-              "code_fix": ["Fix an off-by-one bug in Python binary search."],
-              "code_gen": ["Implement breadth-first search in Python."],
-              "reasoning": ["If 5 workers finish a job in 12 days, how many days for 8 workers?"],
-              "structured_output": ["Return a JSON object with keys status and timeout_ms."],
-              "robustness": ["Write a safe divide(a,b) function in Python handling zero."]
+              "reasoning_math": ["If 5 workers finish a job in 12 days, how many days for 8 workers?"],
+              "coding_logic": ["Write a safe divide(a,b) function in Python handling zero."]
           }
 
           records = []
@@ -81,15 +82,15 @@ jobs:
               for prompt in prompts:
                   print(f"\nPrompting: {prompt}")
                   
-                  print("\n>>> TEACHER GENERATION:")
-                  teacher_ans = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, prompt), 
+                  print("\n>>> TEACHER GENERATION (With CoT Enforcement):")
+                  # The teacher now outputs the internal strategy it uses
+                  teacher_ans = generate(teacher_model, teacher_tok, prompt=promptify(teacher_tok, prompt, enforce_cot=True), 
                                          max_tokens=max_new_tokens, verbose=True).strip()
                   
-                  print("\n>>> STUDENT GENERATION:")
-                  student_ans = generate(student_model, student_tok, prompt=promptify(student_tok, prompt), 
+                  print("\n>>> STUDENT BASELINE GENERATION:")
+                  student_ans = generate(student_model, student_tok, prompt=promptify(student_tok, prompt, enforce_cot=False), 
                                          max_tokens=max_new_tokens, verbose=True).strip()
 
-                  # FIX: Changed key "teacher" to "completion" to adhere to MLX completions format
                   records.append({"prompt": prompt, "completion": teacher_ans})
 
           bench_dir = Path(os.environ["BENCH_DIR"])
@@ -101,39 +102,25 @@ jobs:
 
           "${VENV_DIR}/bin/python" scripts/stage1_benchmark.py
 
-      - name: Stage 2 - Run Real-Time DoRA Training & Evaluation
+      - name: Stage 2 - Train Student on Reasoning Paths
         run: |
           set -euxo pipefail
           export PATH="${VENV_DIR}/bin:$PATH"
 
-          # 1. Prepare raw data directly into the folder
           mkdir -p "${STRATEGY_ROOT}/dora_run"
           
-          # Multiply data so test doesn't crash on batch limits
           python -c "
           import json, os
           with open('$BENCH_DIR/minimal_train.jsonl') as f:
               lines = [line.strip() for line in f if line.strip()]
-          padded = lines * 4
+          padded = lines * 8
           for filename in ['train.jsonl', 'valid.jsonl', 'test.jsonl']:
               with open(f'$STRATEGY_ROOT/dora_run/{filename}', 'w') as out:
                   out.write('\n'.join(padded) + '\n')
           "
 
-          # 2. Baseline test
           echo "########################################################################"
-          echo "STAGE 2: BASELINE EVALUATION"
-          echo "########################################################################"
-          mlx_lm.lora \
-            --model "${STUDENT_MODEL}" \
-            --data "${STRATEGY_ROOT}/dora_run" \
-            --adapter-path "" \
-            --batch-size 1 \
-            --test
-
-          # 3. Training
-          echo "########################################################################"
-          echo "STAGE 2: DORA ADAPTATION TRAINING"
+          echo "DORA ADAPTATION TRAINING ON COT"
           echo "########################################################################"
           mlx_lm.lora \
             --model "${STUDENT_MODEL}" \
@@ -147,9 +134,8 @@ jobs:
             --learning-rate 1e-5 \
             --mask-prompt
 
-          # 4. Final test
           echo "########################################################################"
-          echo "STAGE 2: FINAL ADAPTED EVALUATION"
+          echo "POST-DISTILLATION EVALUATION"
           echo "########################################################################"
           mlx_lm.lora \
             --model "${STUDENT_MODEL}" \
@@ -157,5 +143,3 @@ jobs:
             --data "${STRATEGY_ROOT}/dora_run" \
             --batch-size 1 \
             --test
-
-          echo "Workflow finished. Check console above for all evaluation results."
