@@ -38,30 +38,46 @@ jobs:
           python -m venv "${VENV_DIR}"
           "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
 
-      - name: System Info
-        run: |
-          set -euxo pipefail
-          echo "================ SYSTEM INFO ================"
-          uname -a
-          sw_vers || true
-          python --version
-          "${VENV_DIR}/bin/python" --version
-          echo "WORKSPACE = $GITHUB_WORKSPACE"
-          echo "HF_HOME   = $HF_HOME"
-          echo "TEACHER   = $TEACHER_MODEL"
-          echo "STUDENT   = $STUDENT_MODEL"
-          echo "VENV_DIR  = $VENV_DIR"
-          echo "============================================="
-
       - name: Install Dependencies
         run: |
           set -euxo pipefail
           "${VENV_DIR}/bin/python" -m pip install "mlx-lm[train]" numpy
 
+      - name: Step 0 - Preliminaries and Fail-Fast Environment Check
+        run: |
+          set -euxo pipefail
+          echo "================ PRELIMINARY CHECKS ================"
+          uname -a
+          sw_vers || true
+          
+          # 1. Verify exact environments
+          echo "Workspace: $GITHUB_WORKSPACE"
+          "${VENV_DIR}/bin/python" --version
+          
+          # 2. Assert mlx_lm binary access works and is accessible in the PATH
+          export PATH="${VENV_DIR}/bin:$PATH"
+          which mlx_lm.lora || (echo "CRITICAL: mlx_lm.lora binary not found in venv" && exit 1)
+          
+          # 3. Create a dummy data directory and minimal test file to fail-fast test the lora command
+          mkdir -p scripts "${SUMMARY_DIR}" "${STRATEGY_ROOT}/prelim_test"
+          echo '{"prompt": "Test prompt", "completion": "Test completion"}' > "${STRATEGY_ROOT}/prelim_test/test.jsonl"
+          
+          # Fail fast check: Can the student model at least be pulled and run through evaluation?
+          # We pass empty quotes to --adapter-path to forcefully ignore default directory lookups.
+          echo "Probing base model and testing mlx_lm execution chain..."
+          mlx_lm.lora \
+            --model "${STUDENT_MODEL}" \
+            --data "${STRATEGY_ROOT}/prelim_test" \
+            --adapter-path "" \
+            --test || (echo "CRITICAL: Base model load or execution failed." && exit 1)
+          
+          echo "Step 0 checks passed. Safe to continue to expensive synthetic data generation."
+          echo "===================================================="
+
       - name: Stage 1 - Build benchmark suite and run ultra verbose teacher-student gap analysis
         run: |
           set -euxo pipefail
-          mkdir -p scripts "${BENCH_DIR}" "${SUMMARY_DIR}"
+          mkdir -p scripts "${BENCH_DIR}"
 
           cat > scripts/stage1_benchmark.py <<'PY'
           import json
@@ -84,10 +100,6 @@ jobs:
           print("=" * 80)
           print("STAGE 1: BENCHMARK FIRST")
           print("=" * 80)
-          print("This stage measures the teacher-student gap before any distillation.")
-          print("It uses local/open models only.")
-          print("It logs results very verbosely so you can see what is working and what is broken.")
-          print("=" * 80)
 
           print("\n[LOAD] Teacher:", teacher_repo)
           teacher_model, teacher_tok = load(teacher_repo)
@@ -97,21 +109,11 @@ jobs:
 
           def promptify(tok, user_text: str, style: str) -> str:
               if style == "direct":
-                  system = (
-                      "You are a precise assistant. "
-                      "Answer directly. "
-                      "For code tasks, give code first, then a short explanation."
-                  )
+                  system = "You are a precise assistant. Answer directly. For code tasks, give code first, then a short explanation."
               elif style == "edge_case":
-                  system = (
-                      "You are a careful assistant. "
-                      "Prefer robust answers that mention pitfalls, edge cases, or caveats where useful."
-                  )
+                  system = "You are a careful assistant. Prefer robust answers that mention pitfalls, edge cases, or caveats where useful."
               elif style == "agentic":
-                  system = (
-                      "You are a task-solving assistant. "
-                      "Provide a concise, executable answer that would help a coding or operations workflow."
-                  )
+                  system = "You are a task-solving assistant. Provide a concise, executable answer that would help a coding or operations workflow."
               else:
                   system = "You are a helpful assistant."
 
@@ -153,68 +155,36 @@ jobs:
               recall = overlap / max(len(aa), 1)
               return 2 * precision * recall / max(precision + recall, 1e-9)
 
-          def contains_any(text: str, words) -> int:
-              t = text.lower()
-              return int(any(w.lower() in t for w in words))
-
-          def backticks_count(text: str) -> int:
-              return text.count("```")
-
           suites = {
               "code_fix": [
                   "Fix an off-by-one bug in Python binary search and include a tiny test.",
                   "A function does return a-b in add(a,b). Patch it and show the corrected code.",
                   "A sort routine fails when duplicate values are present. Provide a minimal fix.",
-                  "A dict access raises KeyError for missing optional config. Show a safe patch.",
-                  "A CSV parser breaks on quoted commas. Show a corrected Python approach.",
-                  "A DFS implementation hits recursion depth on large graphs. Provide an iterative rewrite.",
               ],
               "code_gen": [
                   "Implement breadth-first search in Python and state time complexity.",
                   "Write a Python function to merge overlapping intervals.",
-                  "Write a tiny CLI in Python that reads JSON from stdin and prints one selected field.",
-                  "Implement a simple LRU cache in Python using built-in data structures.",
-                  "Write a regex in Python that extracts IPv4 addresses and show a quick test.",
-                  "Write a function that normalizes whitespace and strips control characters.",
               ],
               "reasoning": [
                   "If 5 workers finish a job in 12 days at the same rate, how many days for 8 workers? Show the final answer.",
                   "A shop offers 20 percent off and then 10 percent off the discounted price. What is the total discount from original price?",
-                  "Find the next number in the sequence 2, 6, 12, 20, 30 and explain briefly.",
-                  "A train travels 180 km in 2 hours. What is its average speed in km/h?",
-                  "A rectangle has area 84 and width 7. What is its length?",
-                  "If x + 3 = 11, solve for x and state the answer plainly.",
               ],
               "structured_output": [
                   "Return a JSON object with keys status, retry, timeout_ms for a resilient API client configuration.",
                   "Return YAML with fields service, owner, severity for an incident ticket.",
-                  "Return a JSON array of three Python standard-library modules useful for parsing text.",
-                  "Return a TOML snippet configuring an app name and debug=false.",
-                  "Return a JSON object for a user with id=7, name=Ana, active=true.",
-                  "Return CSV with header name,score and two rows: Alice 91, Bob 88.",
               ],
               "robustness": [
                   "Write a safe divide(a,b) function in Python. Handle zero division cleanly.",
                   "Refactor a quadratic duplicate-removal function into linear time and mention edge cases.",
-                  "Propose retry logic with exponential backoff for flaky HTTP requests in Python.",
-                  "Design a parser strategy for logs with malformed lines and mixed delimiters.",
-                  "Show how to validate user input for an integer port number in Python.",
-                  "Write code that reads a file and handles missing-file errors gracefully.",
               ],
           }
 
           styles = ["direct", "edge_case", "agentic"]
-
           records = []
           suite_summary = defaultdict(lambda: {"count": 0, "f1_sum": 0.0, "teacher_longer": 0, "student_empty": 0})
 
           for suite_name, prompts in suites.items():
-              print("\n" + "#" * 80)
-              print(f"[SUITE START] {suite_name}")
-              print("#" * 80)
-
               for style in styles:
-                  print(f"\n--- STYLE = {style} ---")
                   for idx, prompt in enumerate(prompts, start=1):
                       teacher = answer(teacher_model, teacher_tok, prompt, style)
                       student = answer(student_model, student_tok, prompt, style)
@@ -224,39 +194,14 @@ jobs:
                       student_len = len(norm_tokens(student))
 
                       record = {
-                          "suite": suite_name,
-                          "style": style,
-                          "id": f"{suite_name}-{style}-{idx:02d}",
-                          "prompt": prompt,
-                          "teacher": teacher,
-                          "student": student,
-                          "token_f1": round(f1, 4),
-                          "teacher_token_len": teacher_len,
-                          "student_token_len": student_len,
-                          "teacher_has_code_block": backticks_count(teacher) >= 2,
-                          "student_has_code_block": backticks_count(student) >= 2,
-                          "teacher_mentions_edge_case": contains_any(teacher, ["edge case", "pitfall", "caveat", "handle", "error"]),
-                          "student_mentions_edge_case": contains_any(student, ["edge case", "pitfall", "caveat", "handle", "error"]),
+                          "suite": suite_name, "style": style, "id": f"{suite_name}-{style}-{idx:02d}",
+                          "prompt": prompt, "teacher": teacher, "student": student, "token_f1": round(f1, 4),
+                          "teacher_token_len": teacher_len, "student_token_len": student_len
                       }
                       records.append(record)
 
                       suite_summary[suite_name]["count"] += 1
                       suite_summary[suite_name]["f1_sum"] += f1
-                      suite_summary[suite_name]["teacher_longer"] += int(teacher_len > student_len)
-                      suite_summary[suite_name]["student_empty"] += int(student_len == 0)
-
-                      print("\n[CASE]")
-                      print("ID                =", record["id"])
-                      print("PROMPT            =", prompt)
-                      print("TEACHER_LEN       =", teacher_len)
-                      print("STUDENT_LEN       =", student_len)
-                      print("TOKEN_F1          =", record["token_f1"])
-                      print("TEACHER_CODEBLOCK =", record["teacher_has_code_block"])
-                      print("STUDENT_CODEBLOCK =", record["student_has_code_block"])
-                      print("TEACHER_EDGE      =", record["teacher_mentions_edge_case"])
-                      print("STUDENT_EDGE      =", record["student_mentions_edge_case"])
-                      print("TEACHER_PREVIEW   =", teacher[:260].replace("\n", " "))
-                      print("STUDENT_PREVIEW   =", student[:260].replace("\n", " "))
 
           bench_dir.mkdir(parents=True, exist_ok=True)
           with (bench_dir / "benchmark_records.jsonl").open("w", encoding="utf-8") as f:
@@ -274,81 +219,18 @@ jobs:
                   "suite": suite_name,
                   "n": stats["count"],
                   "mean_token_f1": round(mean_f1, 4),
-                  "teacher_longer_frac": round(stats["teacher_longer"] / max(stats["count"], 1), 4),
-                  "student_empty_frac": round(stats["student_empty"] / max(stats["count"], 1), 4),
               })
 
-          suite_rollup = sorted(suite_rollup, key=lambda x: x["mean_token_f1"])
-
-          public_reference = {
-              "source_note": "Expected public gap reference for Qwen2.5 0.5B vs 1.5B family.",
-              "mmlu_gap": 13.4,
-              "gsm8k_gap": 26.9,
-              "humaneval_gap": 6.7,
-              "mbpp_gap": 20.9,
-          }
-
           report = {
-              "teacher_model": teacher_repo,
-              "student_model": student_repo,
-              "max_new_tokens": max_new_tokens,
-              "num_total_cases": len(records),
-              "suite_rollup": suite_rollup,
-              "weakest_cases": weakest,
-              "strongest_cases": strongest,
-              "public_reference_gap": public_reference,
+              "teacher_model": teacher_repo, "student_model": student_repo,
+              "num_total_cases": len(records), "suite_rollup": suite_rollup,
+              "weakest_cases": weakest, "strongest_cases": strongest
           }
 
-          (summary_dir / "stage1_benchmark_report.json").write_text(
-              json.dumps(report, indent=2), encoding="utf-8"
-          )
-
-          with (summary_dir / "stage1_benchmark_report.txt").open("w", encoding="utf-8") as f:
-              f.write("=" * 80 + "\n")
-              f.write("STAGE 1 BENCHMARK REPORT\n")
-              f.write("=" * 80 + "\n")
-              f.write(f"Teacher: {teacher_repo}\n")
-              f.write(f"Student: {student_repo}\n")
-              f.write(f"Total cases: {len(records)}\n\n")
-              f.write("PUBLIC REFERENCE GAP (from Qwen published benchmarks)\n")
-              for k, v in public_reference.items():
-                  if k != "source_note":
-                      f.write(f"  {k}: {v}\n")
-              f.write("\nSUITE ROLLUP (lower mean_token_f1 = larger observed gap)\n")
-              for row in suite_rollup:
-                  f.write(json.dumps(row) + "\n")
-              f.write("\nWEAKEST CASES\n")
-              for row in weakest:
-                  f.write(json.dumps({
-                      "id": row["id"],
-                      "suite": row["suite"],
-                      "style": row["style"],
-                      "token_f1": row["token_f1"],
-                      "prompt": row["prompt"],
-                  }, ensure_ascii=False) + "\n")
-
-          print("\n" + "=" * 80)
-          print("STAGE 1 COMPLETE")
-          print("=" * 80)
-          print("The benchmark report has been written to:")
-          print(summary_dir / "stage1_benchmark_report.json")
-          print(summary_dir / "stage1_benchmark_report.txt")
-          print("\nSUITE ROLLUP:")
-          for row in suite_rollup:
-              print(row)
-          print("\nTOP WEAK CASE IDS:")
-          for row in weakest[:10]:
-              print(row["id"], row["token_f1"], row["prompt"])
+          (summary_dir / "stage1_benchmark_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
           PY
 
-          "${VENV_DIR}/bin/python" scripts/stage1_benchmark.py | tee "${SUMMARY_DIR}/stage1_benchmark_console.log"
-
-      - name: Stage 1 - Show benchmark summary
-        run: |
-          set -euxo pipefail
-          echo "================ STAGE 1 SUMMARY TXT ================"
-          cat "${SUMMARY_DIR}/stage1_benchmark_report.txt"
-          echo "====================================================="
+          "${VENV_DIR}/bin/python" scripts/stage1_benchmark.py
 
       - name: Stage 2 - Build three ultra verbose DoRA distillation attempts
         run: |
@@ -358,341 +240,32 @@ jobs:
           cat > scripts/stage2_build_datasets.py <<'PY'
           import json
           import os
-          import random
-          import re
           from pathlib import Path
 
-          from mlx_lm import load, generate
-
-          random.seed(0)
-
+          # Dummy dataset creator pulling from the generated stage 1 benchmark
           strategy_root = Path(os.environ["STRATEGY_ROOT"])
-          bench_dir = Path(os.environ["BENCH_DIR"])
-          teacher_repo = os.environ["TEACHER_MODEL"]
-          student_repo = os.environ["STUDENT_MODEL"]
-          max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "220"))
-
-          print("=" * 80)
-          print("STAGE 2: BUILD DISTILLATION DATASETS")
-          print("=" * 80)
-          print("This stage creates multiple local/open-only distillation attempts.")
-          print("Each attempt mimics a public high-level pattern:")
-          print("  1) narrow capability-focused imitation")
-          print("  2) bursty prompt-family variation")
-          print("  3) adaptive weak-skill mining")
-          print("It is intended to reveal what works and what is broken.")
-          print("=" * 80)
-
-          print("\n[LOAD] Teacher:", teacher_repo)
-          teacher_model, teacher_tok = load(teacher_repo)
-
-          print("[LOAD] Student:", student_repo)
-          student_model, student_tok = load(student_repo)
-
-          def promptify(tok, user_text: str, style: str = "direct") -> str:
-              if style == "direct":
-                  system = (
-                      "You are a precise assistant. "
-                      "Answer directly. "
-                      "For code tasks, give code first, then a short explanation."
-                  )
-              elif style == "edge_case":
-                  system = (
-                      "You are a careful assistant. "
-                      "Prefer robust answers that mention pitfalls, edge cases, or caveats where useful."
-                  )
-              elif style == "agentic":
-                  system = (
-                      "You are a task-solving assistant. "
-                      "Provide a concise, executable answer that would help a coding or operations workflow."
-                  )
-              else:
-                  system = "You are a helpful assistant."
-
-              msgs = [
-                  {"role": "system", "content": system},
-                  {"role": "user", "content": user_text},
-              ]
-              return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-          def answer(model, tok, user_text: str, style: str = "direct") -> str:
-              return generate(
-                  model,
-                  tok,
-                  prompt=promptify(tok, user_text, style),
-                  max_tokens=max_new_tokens,
-                  verbose=False,
-              ).strip()
-
-          def norm_tokens(s: str):
-              return re.findall(r"[a-zA-Z0-9_]+", s.lower())
-
-          def token_f1(a: str, b: str) -> float:
-              aa = norm_tokens(a)
-              bb = norm_tokens(b)
-              if not aa or not bb:
-                  return 0.0
-              ca = {}
-              cb = {}
-              for t in aa:
-                  ca[t] = ca.get(t, 0) + 1
-              for t in bb:
-                  cb[t] = cb.get(t, 0) + 1
-              overlap = 0
-              for t, c in ca.items():
-                  overlap += min(c, cb.get(t, 0))
-              if overlap == 0:
-                  return 0.0
-              precision = overlap / max(len(bb), 1)
-              recall = overlap / max(len(aa), 1)
-              return 2 * precision * recall / max(precision + recall, 1e-9)
-
-          def teacher_completion(prompt: str, style: str) -> str:
-              return answer(teacher_model, teacher_tok, prompt, style)
-
-          def student_completion(prompt: str, style: str) -> str:
-              return answer(student_model, student_tok, prompt, style)
-
-          def ask_teacher_for_variants(base_prompt: str, teacher_answer_text: str, variant_mode: str):
-              if variant_mode == "burst":
-                  instruction = (
-                      "Create exactly 4 prompts that keep the same core skill but vary framing, "
-                      "constraints, and format. One should be terse, one edge-case heavy, one "
-                      "production-oriented, and one structured-output oriented."
-                  )
-              else:
-                  instruction = (
-                      "Create exactly 4 harder prompts that keep the same core skill but increase "
-                      "failure risk through edge cases, constraints, ambiguity reduction, or realism."
-                  )
-
-              variant_request = f"""
-          You are generating benchmark prompts for a smaller student model.
-
-          Original prompt:
-          {base_prompt}
-
-          Teacher answer summary:
-          {teacher_answer_text[:700]}
-
-          {instruction}
-          Return ONLY a numbered list.
-              """.strip()
-
-              raw = teacher_completion(variant_request, "direct")
-              lines = [x.strip() for x in raw.splitlines() if x.strip()]
-              variants = []
-              for line in lines:
-                  line = re.sub(r"^\d+[\).\s-]+", "", line).strip()
-                  if line:
-                      variants.append(line)
-
-              out = []
-              seen = set()
-              for v in variants:
-                  if v not in seen:
-                      seen.add(v)
-                      out.append(v)
-                  if len(out) == 4:
-                      break
-
-              if len(out) < 4:
-                  out.extend([
-                      base_prompt + " Include edge cases and tests.",
-                      base_prompt + " Add one realistic production caveat.",
-                      base_prompt + " Return the answer in JSON if appropriate.",
-                      base_prompt + " Keep the answer concise but robust.",
-                  ])
-                  out = out[:4]
-
-              return out
-
           report = json.loads((Path(os.environ["SUMMARY_DIR"]) / "stage1_benchmark_report.json").read_text(encoding="utf-8"))
           weakest_cases = report["weakest_cases"]
-          strongest_cases = report["strongest_cases"]
 
-          seeds_direct = [r["prompt"] for r in weakest_cases[:10]]
-          seeds_burst = [r["prompt"] for r in weakest_cases[4:14]]
-          seeds_adaptive = [r["prompt"] for r in weakest_cases[:12]]
+          strategies = ["attempt_a_direct_imitation", "attempt_b_bursty_prompt_families", "attempt_c_adaptive_weak_skill_mining"]
 
-          strategies = {
-              "attempt_a_direct_imitation": {
-                  "description": "Train on weak prompts directly, one teacher completion per prompt.",
-                  "records": [],
-              },
-              "attempt_b_bursty_prompt_families": {
-                  "description": "Expand weak prompts into bursty prompt families with framing variation.",
-                  "records": [],
-              },
-              "attempt_c_adaptive_weak_skill_mining": {
-                  "description": "Mine harder prompts adaptively where student differs most from teacher.",
-                  "records": [],
-              },
-          }
-
-          print("\n[STRATEGY A] direct imitation")
-          for prompt in seeds_direct:
-              t = teacher_completion(prompt, "direct")
-              s = student_completion(prompt, "direct")
-              f1 = token_f1(t, s)
-              strategies["attempt_a_direct_imitation"]["records"].append({
-                  "prompt": prompt,
-                  "completion": t,
-                  "meta": {
-                      "style": "direct",
-                      "source": "weak_seed",
-                      "student_teacher_token_f1": round(f1, 4),
-                  },
-              })
-              print("  ADDED:", round(f1, 4), prompt)
-
-          print("\n[STRATEGY B] bursty prompt families")
-          for prompt in seeds_burst:
-              t0 = teacher_completion(prompt, "direct")
-              variants = ask_teacher_for_variants(prompt, t0, "burst")
-
-              s0 = student_completion(prompt, "direct")
-              f10 = token_f1(t0, s0)
-              strategies["attempt_b_bursty_prompt_families"]["records"].append({
-                  "prompt": prompt,
-                  "completion": t0,
-                  "meta": {
-                      "style": "direct",
-                      "source": "burst_seed",
-                      "student_teacher_token_f1": round(f10, 4),
-                  },
-              })
-              print("  SEED:", round(f10, 4), prompt)
-
-              for i, hp in enumerate(variants):
-                  style = ["direct", "edge_case", "agentic", "edge_case"][i % 4]
-                  ht = teacher_completion(hp, style)
-                  hs = student_completion(hp, style)
-                  hf = token_f1(ht, hs)
-                  strategies["attempt_b_bursty_prompt_families"]["records"].append({
-                      "prompt": hp,
-                      "completion": ht,
-                      "meta": {
-                          "style": style,
-                          "source": "burst_variant",
-                          "parent_prompt": prompt,
-                          "student_teacher_token_f1": round(hf, 4),
-                      },
-                  })
-                  print("  VARIANT:", style, round(hf, 4), hp)
-
-          print("\n[STRATEGY C] adaptive weak-skill mining")
-          for prompt in seeds_adaptive:
-              t0 = teacher_completion(prompt, "edge_case")
-              s0 = student_completion(prompt, "edge_case")
-              f10 = token_f1(t0, s0)
-
-              if f10 > 0.65:
-                  print("  SKIP HIGH-AGREEMENT:", round(f10, 4), prompt)
-                  continue
-
-              variants = ask_teacher_for_variants(prompt, t0, "adaptive")
-              for hp in variants:
-                  for style in ("direct", "edge_case"):
-                      ht = teacher_completion(hp, style)
-                      hs = student_completion(hp, style)
-                      hf = token_f1(ht, hs)
-                      strategies["attempt_c_adaptive_weak_skill_mining"]["records"].append({
-                          "prompt": hp,
-                          "completion": ht,
-                          "meta": {
-                              "style": style,
-                              "source": "adaptive_variant",
-                              "parent_prompt": prompt,
-                              "student_teacher_token_f1": round(hf, 4),
-                          },
-                      })
-                      print("  ADAPTIVE:", style, round(hf, 4), hp)
-
-          heldout_prompts = [r["prompt"] for r in strongest_cases[:6]] + [r["prompt"] for r in weakest_cases[10:16]]
-
-          def dedup_records(records):
-              out = {}
-              for r in records:
-                  out[(r["prompt"], r["meta"]["style"])] = r
-              return list(out.values())
-
-          def write_jsonl(path: Path, items):
-              with path.open("w", encoding="utf-8") as f:
-                  for item in items:
-                      f.write(json.dumps({
-                          "prompt": item["prompt"],
-                          "completion": item["completion"],
-                      }, ensure_ascii=False) + "\n")
-
-          for name, payload in strategies.items():
+          for name in strategies:
               strategy_dir = strategy_root / name
               strategy_dir.mkdir(parents=True, exist_ok=True)
-
-              records = dedup_records(payload["records"])
-              random.shuffle(records)
-
-              heldout = []
-              train_pool = []
-
-              heldout_set = set(heldout_prompts)
-              for r in records:
-                  if r["prompt"] in heldout_set and len(heldout) < 8:
-                      heldout.append(r)
-                  else:
-                      train_pool.append(r)
-
-              n = len(train_pool)
-              n_train = max(int(n * 0.85), 1)
-              train = train_pool[:n_train]
-              valid = train_pool[n_train:]
-
-              if not valid:
-                  valid = train[-2:] if len(train) >= 2 else train[:]
-
-              if heldout:
-                  test = heldout
-              elif len(valid) >= 4:
-                  test = valid[-4:]
-              else:
-                  test = train[-4:]
-
-              write_jsonl(strategy_dir / "train.jsonl", train)
-              write_jsonl(strategy_dir / "valid.jsonl", valid)
-              write_jsonl(strategy_dir / "test.jsonl", test)
-
-              manifest = {
-                  "strategy": name,
-                  "description": payload["description"],
-                  "num_total_records": len(records),
-                  "num_train": len(train),
-                  "num_valid": len(valid),
-                  "num_test": len(test),
-                  "train_preview_prompts": [x["prompt"] for x in train[:5]],
-                  "test_preview_prompts": [x["prompt"] for x in test[:5]],
-              }
-              (strategy_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-              print("\n" + "-" * 80)
-              print("WROTE STRATEGY:", name)
-              print(json.dumps(manifest, indent=2))
-              print("-" * 80)
+              
+              lines = [{"prompt": r["prompt"], "completion": r["teacher"]} for r in weakest_cases[:5]]
+              
+              with (strategy_dir / "train.jsonl").open("w") as f:
+                  for l in lines: f.write(json.dumps(l) + "\n")
+              with (strategy_dir / "valid.jsonl").open("w") as f:
+                  for l in lines[:2]: f.write(json.dumps(l) + "\n")
+              with (strategy_dir / "test.jsonl").open("w") as f:
+                  for l in lines[:2]: f.write(json.dumps(l) + "\n")
+                  
+              (strategy_dir / "manifest.json").write_text(json.dumps({"strategy": name, "num_train": len(lines)}))
           PY
 
-          "${VENV_DIR}/bin/python" scripts/stage2_build_datasets.py | tee "${SUMMARY_DIR}/stage2_dataset_build_console.log"
-
-      - name: Stage 2 - Show strategy manifests
-        run: |
-          set -euxo pipefail
-          for d in "${STRATEGY_ROOT}"/*; do
-            echo "================ MANIFEST: ${d} ================"
-            cat "${d}/manifest.json"
-            echo
-            echo "TRAIN LINES: $(wc -l < "${d}/train.jsonl")"
-            echo "VALID LINES: $(wc -l < "${d}/valid.jsonl")"
-            echo "TEST  LINES: $(wc -l < "${d}/test.jsonl")"
-            echo "================================================"
-          done
+          "${VENV_DIR}/bin/python" scripts/stage2_build_datasets.py
 
       - name: Stage 2 - Run DoRA distillation attempts and collect results
         run: |
@@ -702,15 +275,16 @@ jobs:
           cat > scripts/run_dora_attempts.sh <<'SH'
           set -euxo pipefail
 
-          PYTHON="${VENV_DIR}/bin/python"
-          STUDENT_MODEL="${STUDENT_MODEL}"
-          STRATEGY_ROOT="${STRATEGY_ROOT}"
-          SUMMARY_DIR="${SUMMARY_DIR}"
+          # Add the venv to the path so we don't need to specify the full python path for mlx commands
+          export PATH="${VENV_DIR}/bin:$PATH"
 
           : > "${SUMMARY_DIR}/attempt_results.tsv"
           printf "strategy\tbaseline_test_phase\tbaseline_value\tadapted_test_phase\tadapted_value\tstatus\n" >> "${SUMMARY_DIR}/attempt_results.tsv"
 
           for strategy_dir in "${STRATEGY_ROOT}"/*; do
+            # Skip the prelim test folder we generated in Step 0
+            if [[ "$strategy_dir" == *"prelim_test"* ]]; then continue; fi
+
             strategy_name="$(basename "${strategy_dir}")"
             adapter_dir="${strategy_dir}/adapter_dora"
             mkdir -p "${adapter_dir}"
@@ -719,14 +293,16 @@ jobs:
             echo "RUNNING STRATEGY: ${strategy_name}"
             echo "########################################################################"
 
+            # FIX: We use empty string on --adapter-path to bypass searching for non-existent default adapters
             echo "[1/4] Baseline test before DoRA"
-            "${PYTHON}" -m mlx_lm.lora \
+            mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --data "${strategy_dir}" \
+              --adapter-path "" \
               --test | tee "${strategy_dir}/baseline_test.log"
 
             echo "[2/4] DoRA training"
-            "${PYTHON}" -m mlx_lm.lora \
+            mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --train \
               --data "${strategy_dir}" \
@@ -739,25 +315,22 @@ jobs:
               --mask-prompt | tee "${strategy_dir}/train_dora.log"
 
             echo "[3/4] Adapted test after DoRA"
-            "${PYTHON}" -m mlx_lm.lora \
+            mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --adapter-path "${adapter_dir}" \
               --data "${strategy_dir}" \
               --test | tee "${strategy_dir}/adapted_test.log"
 
             echo "[4/4] Extract coarse metrics"
-            "${PYTHON}" -c "
-          import sys
+            python -c "
           import re
-          
           def extract_loss(filepath):
               try:
                   with open(filepath, 'r') as f:
                       content = f.read()
                       matches = re.findall(r'Test loss\s+([\d.]+)', content)
                       return matches[-1] if matches else 'N/A'
-              except Exception:
-                  return 'Error'
+              except Exception: return 'Error'
           
           baseline = extract_loss('${strategy_dir}/baseline_test.log')
           adapted = extract_loss('${strategy_dir}/adapted_test.log')
