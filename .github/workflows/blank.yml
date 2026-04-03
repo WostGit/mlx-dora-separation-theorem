@@ -58,17 +58,24 @@ jobs:
           export PATH="${VENV_DIR}/bin:$PATH"
           which mlx_lm.lora || (echo "CRITICAL: mlx_lm.lora binary not found in venv" && exit 1)
           
-          # 3. Create a dummy data directory and minimal test file to fail-fast test the lora command
+          # 3. Create a dummy data directory and at least 4 test lines to satisfy batch size
           mkdir -p scripts "${SUMMARY_DIR}" "${STRATEGY_ROOT}/prelim_test"
-          echo '{"prompt": "Test prompt", "completion": "Test completion"}' > "${STRATEGY_ROOT}/prelim_test/test.jsonl"
+          
+          cat > "${STRATEGY_ROOT}/prelim_test/test.jsonl" << 'EOF'
+          {"prompt": "Test prompt 1", "completion": "Test completion 1"}
+          {"prompt": "Test prompt 2", "completion": "Test completion 2"}
+          {"prompt": "Test prompt 3", "completion": "Test completion 3"}
+          {"prompt": "Test prompt 4", "completion": "Test completion 4"}
+          EOF
           
           # Fail fast check: Can the student model at least be pulled and run through evaluation?
-          # We pass empty quotes to --adapter-path to forcefully ignore default directory lookups.
+          # Added --batch-size 1 to ensure it doesn't complain about data size
           echo "Probing base model and testing mlx_lm execution chain..."
           mlx_lm.lora \
             --model "${STUDENT_MODEL}" \
             --data "${STRATEGY_ROOT}/prelim_test" \
             --adapter-path "" \
+            --batch-size 1 \
             --test || (echo "CRITICAL: Base model load or execution failed." && exit 1)
           
           echo "Step 0 checks passed. Safe to continue to expensive synthetic data generation."
@@ -293,12 +300,12 @@ jobs:
             echo "RUNNING STRATEGY: ${strategy_name}"
             echo "########################################################################"
 
-            # FIX: We use empty string on --adapter-path to bypass searching for non-existent default adapters
             echo "[1/4] Baseline test before DoRA"
             mlx_lm.lora \
               --model "${STUDENT_MODEL}" \
               --data "${strategy_dir}" \
               --adapter-path "" \
+              --batch-size 1 \
               --test | tee "${strategy_dir}/baseline_test.log"
 
             echo "[2/4] DoRA training"
@@ -319,6 +326,7 @@ jobs:
               --model "${STUDENT_MODEL}" \
               --adapter-path "${adapter_dir}" \
               --data "${strategy_dir}" \
+              --batch-size 1 \
               --test | tee "${strategy_dir}/adapted_test.log"
 
             echo "[4/4] Extract coarse metrics"
